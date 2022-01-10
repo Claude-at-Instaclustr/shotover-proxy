@@ -55,6 +55,9 @@ cassandra-protocol = { git = "https://github.com/krojew/cdrs-tokio", rev="e1de5f
 rdkafka = "0.28"
 crc16 = "0.4.0"
 
+bloomfilter = { git = "https://github.com/Claude-at-Instaclustr/rusty_bloomfilter", brach="main" }
+murmur3 = "^0.5.1"
+
 #Crypto
 sodiumoxide = "0.2.5"
 rusoto_kms = "0.47.0"
