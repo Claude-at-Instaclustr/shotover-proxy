@@ -55,57 +55,6 @@ impl Clone for CassandraBloomFilter {
     }
 }
 
-enum ColumnType {
-    Custom( String ),
-    ASCII(),
-    Bigint(),
-    Blob(),
-    Boolean(),
-    Counter(),
-    Decimal(),
-    Double(),
-    Float(),
-    Int(),
-    Timestamp(),
-    Uuid(),
-    Varchar(),
-    Varint(),
-    Timeuuid(),
-    Inet(),
-    Date(),
-    Time(),
-    Smallint(),
-    Tinyint(),
-    List( ColumnType ),
-    Map( Vec<ColumnType>),
-    Set( ColumnType ),
-    UDT( UdtType ),
-    Tuple( Vec<ColumnType> ),
-    unknown( u16 ),
-}
-
-struct ColMetadata {
-    key_space : Optional<String>,
-    table_name : Optional<String>,
-    column_name : String,
-    column_type : ColumnType,
-}
-
-struct RowMetadata {
-    flags : i32,
-    paging_state : Optional<Vec<u8>>,
-    key_space : Optional<String>,
-    table_name : Optional<String>,
-    columns: Vec<ColMetadata>,
-}
-
-struct UdtType {
-    key_space : String,
-    udt_name : String,
-    names : Vec<String>,
-    types : Vec<ColumnType>,
-}
-
 impl CassandraBloomFilter {
     pub fn new(tables: &HashMap<String, CassandraBloomFilterTableConfig>, bypass: bool, chain_name: String) -> CassandraBloomFilter {
         let sink_single = CassandraBloomFilter {
@@ -187,212 +136,33 @@ impl CassandraBloomFilter {
         }
     }
 
-    fn read_string(body_cursor: &mut Cursor<&[u8]> ) -> String {
-        let mut len = body_cursor.get_i32();
-        let mut buff = Vec::with_capacity( len );
-        body_cursor.read_exact( &buff );
-        String::from_utf8( buff ).unwrap()
-    }
-
-
-    fn parse_type_udt(body_cursor: &mut Cursor<&[u8]>) -> ColumnType::UDT {
-        let key_space = CassandraBloomFilter::read_string( body_cursor );
-        let udt_name = CassandraBloomFilter::read_string( body_cursor );
-        let count = body_cursor.get_i8();
-        let mut names = Vec::with_capacity(count);
-        let mut types :Vec<ColumnType> = Vec::with_capacity(count);
-        for i in 0..count {
-            names.push(CassandraBloomFilter::read_string(body_cursor));
-            types.push(CassandraBloomFilter::parse_type(body_cursor))
-        }
-        ColumnType::UDT( UdtType {
-            key_space,
-            udt_name,
-            names,
-            types,
-        } )
-    }
-
-    fn parse_type_tuple(body_cursor: &mut Cursor<&[u8]>) -> ColumnType::Tuple {
-        let count = body_cursor.get_i32();
-        let mut types  :Vec<ColumnType> = Vec::with_capacity(count);
-        for i in 0..count {
-            types.push( CassandraBloomFilter::parse_type(body_cursor));
-        }
-        ColumnType::Tuple( types )
-    }
-
-    fn parse_type(body_cursor: &mut Cursor<&[u8]>) -> ColumnType {
-        let id = body_cursor.read_u16() ;
-        match  id {
-            0x0000 => ColumnType::Custom( CassandraBloomFilter::read_string(body_cursor)),
-            0x0001 => ColumnType::ASCII() ,
-            0x0002 => ColumnType::Bigint(),
-            0x0003 => ColumnType::Blob(),
-            0x0004 => ColumnType::Boolean(),
-            0x0005 => ColumnType::Counter(),
-            0x0006 => ColumnType::Decimal(),
-            0x0007 => ColumnType::Double(),
-            0x0008 => ColumnType::Float(),
-            0x0009 => ColumnType::Int(),
-            0x000B => ColumnType::Timestamp(),
-            0x000C => ColumnType::Uuid(),
-            0x000D => ColumnType::Varchar(),
-            0x000E => ColumnType::Varint(),
-            0x000F => ColumnType::Timeuuid(),
-            0x0010 => ColumnType::Inet(),
-            0x0011 => ColumnType::Date(),
-            0x0012 => ColumnType::Time(),
-            0x0013 => ColumnType::Smallint(),
-            0x0014 => ColumnType::Tinyint(),
-            0x0020 => ColumnType::List( CassandraBloomFilter::parse_type(body_cursor)),
-            0x0021 => {
-                let mut result : Vec<ColumnType> = Vec::with_capacity(2);
-                result[0] = CassandraBloomFilter::parse_type(body_cursor);
-                result[1] = CassandraBloomFilter::parse_type(body_cursor);
-                return ColumnType::Map( result );
-            },
-            0x0022 => ColumnType::Set( CassandraBloomFilter::parse_type( body_cursor)),
-            0x0030 => ColumnType::UDT( CassandraBloomFilter::parse_type_udt() ),
-            0x0031 => ColumnType::Tuple( CassandraBloomFilter::parse_type_tuple() ),
-            _ => ColumnType::unknown( id ),
-        }
-    }
-
-    fn read_bytes( body_cursor: &mut Cursor<&[u8]> ) -> Vec<u8> {
-        let len = body_cursor.get_i32();
-        let buff = Vec::with_capacity( len );
-        body_cursor.read_exact( &buff );
-        buff
-    }
-
-    fn parse_row_metadata( body_cursor: &mut Cursor<&[u8]>  ) -> RowMetadata
-    {
-        let flags = body_cursor.get_i32();
-        let column_count = body_cursor.get_i32();
-        let mut metadata = RowMetadata {
-            flags,
-            paging_state: None,
-            key_space: None,
-            table_name: None,
-            columns: Vec::with_capacity(column_count),
-        };
-        if (flags & 0x0002) > 0 {
-            metadata.paging_state = Some(CassandraBloomFilter::read_bytes( body_cursor ));
-        }
-        match (flags & 0x0001) > 0 {
-            true => {
-                metadata.key_space = Some( CassandraBloomFilter::read_string( body_cursor) );
-                metadata.table_name = Some( CassandraBloomFilter::read_string( body_cursor) );
-            },
-            false => {}
-        }
-        for column_number in 0..column_count {
-            let mut result = ColMetadata {
-                key_space: metadata.key_space.clone(),
-                table_name: metadata.table_name.clone(),
-                column_name: "".to_string(),
-                column_type: ColType { id: 0, value: () },
-            };
-            if (flags & 0x0001) != 0x0001 {
-                result.key_space = Some( CassandraBloomFilter::read_string( body_cursor) );
-                result.table_name = Some( CassandraBloomFilter::read_string( body_cursor) );
-            }
-            result.column_name = CassandraBloomFilter::read_string( body_cursor);
-            result.column_type = CassandraBloomFilter::parse_type ( body_cursor),
-            metadata.columns.push( result );
-        }
-        metadata
-    }
-
-
-    fn parse_row_data( body_cursor: &mut Cursor<&[u8]>, column_count : usize ) -> Vec<Vec<u8>> {
-        let mut result = Vec::with_capacity( column_count );
-        for i in 0..column_count {
-            result.push( CassandraBloomFilter::read_bytes( body_cursor ));
-        }
-        result;
-    }
-
-    fn remove_false_positives(row_data : &mut Vec<Vec<Vec<u8>>>, row_metadata: &RowMetadata, query_values : HashMap<String,Value>) {
-        row_data.retain( |row| {
-            for column_number in 0..row.len() {
-                let column_meta = row_metadata.columns.get(column_number);
-                if let expected = query_values.get(&*column_meta.column_name)? {
-                    if expected != row[column_number] {
-                        return false;
-                    }
+    fn remove_unwanted_data( row_data : &mut Vec<HashMap<String,Value>>, &old_msg : &QueryMessage) {
+        row_data.retain( |mut row| {
+            for (name, expected) in old_msg.query_values?.keys() {
+                if row.get(name) != expected {
+                    return false;
+                }
+                if ! old_msg.projection?.contains( name ) {
+                    row.remove( name );
                 }
             }
             true
-        });
+        };
     }
 
-    fn remove_unwanted_columns(row_data : &mut Vec<Vec<Vec<u8>>>, row_metadata: &mut RowMetadata, projection : Vec<String>) {
-        for row in row_data {
-            let mut column_number = 0;
-            let mut column = row.iter();
-            match column.next() {
-                Some(column_data) => {
-                    let column_meta = row_metadata.columns.get(column_number);
-                    if !projection.contains(column_meta.column_name) {
-                        column.remove(column_number);
-                    }
-                    column_number += 1;
-                },
-                _ => {
-                    column_number += 1;
-                }
-            }
-        }
-        let mut meta = row_meta.columns.iter();
-        let mut column_number = 0;
-        match meta.next() {
-            Some(column_meta) {
-                if !projection.contains(column_meta.column_name) {
-                    column_meta.remove(column_number);
-                }
-                column_number += 1;
-            },
-            _ => {
-                column_number += 1;
-            }
-        }
-    }
-
-    fn process_result( &mut self, msg : &mut Message, stream : &StreamId) {
+    fn process_result( &mut self, query_response : & QueryResponse, stream : &StreamId) {
         let old_msg = self.messages.get(stream)?;
-        let RawFrame::Cassandra(frame) = &msg.original;
-        let mut body_cursor = Cursor::new(frame.body.as_slice());
-        /* The first element of the body of a RESULT message is an [int] representing the
-  `kind` of result. The rest of the body depends on the kind. 0x0002 is the row flag*/
-        if body_cursor.get_i32() == 0x0002 {
-            let mut row_metadata = CassandraBloomFilter::parse_row_metadata( &mut body_cursor );
-            let row_count = body_cursor.get_i32();
-            let mut row_data = Vec::with_capacity(row_count as usize);
-            for i in 0..row_count {
-                row_data.push( CassandraBloomFilter::parse_row_data(&mut body_cursor, row_metadata.columns.len()) );
-            }
-
-            CassandraBloomFilter::remove_false_positives(  &mut row_data,&row_metadata, old_msg.query_values? );
-            CassandraBloomFilter::remove_unwanted_columns( &mut row_data,&mut row_metadata,old_msg.projection?);
-            let new_frame = Frame {
-                version: frame.version,
-                direction: frame.direction,
-                flags: frame.flags,
-                opcode: frame.opcode,
-                stream_id: frame.stream_id,
-                body: CassandraBloomFilter::rebuild_body( & row_data, &row_metadata ),
-                tracing_id: frame.tracing_id,
-                warnings: frame.warnings.clone(),
-            };
-            msg.original = RawFrame::Cassandra( new_frame );
+        match query_response.result.unwrap() {
+            Value::NamedRows(mut rows) => {
+                CassandraBloomFilter::remove_unwanted_data( &mut rows, &old_msg );
+            },
+            _ => {},
         }
     }
 
-    fn extract_bloom_data( &mut self, messages : Messages ) -> Messages {
+    fn process_bloom_data(&mut self, messages : Messages ) -> Messages {
         let mut newMsgs : Messages = vec![];
-        for msg in messages {
+        for mut msg in messages {
             let stream = if let RawFrame::Cassandra(frame) = &msg.original {
                 frame.stream_id
             } else {
@@ -405,7 +175,8 @@ impl CassandraBloomFilter {
                     newMsgs.push(self.process_query(&x));
                 },
                 MessageDetails::Response(x) => {
-                    self.process_result(&mut msg, &stream);
+                    self.process_result(& x, &stream);
+                    msg.modified = true;
                     newMsgs.push(msg.clone());
                 },
                 _ => newMsgs.push(msg.clone()),
@@ -514,17 +285,12 @@ impl CassandraBloomFilter {
 #[async_trait]
 impl Transform for CassandraBloomFilter {
     async fn transform<'a>(&'a mut self, message_wrapper: Wrapper<'a>) -> ChainResponse {
-        self.send_message(self.extract_bloom_data(message_wrapper.messages)).await
+        let messages = self.send_message(self.process_bloom_data(message_wrapper.messages)).await?
+        Ok(self.process_bloom_data( messages ) )
     }
 
     fn is_terminating(&self) -> bool {
-        true
+        false
     }
-
-
-
-
-
-
 
 }
