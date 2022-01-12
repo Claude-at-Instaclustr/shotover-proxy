@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
+use tracing::info;
 
 use crate::config::topology::TopicHolder;
 use crate::error::ChainResponse;
@@ -13,7 +14,7 @@ use crate::transforms::{
     build_chain_from_config, Transform, Transforms, TransformsConfig, Wrapper,
 };
 use bytes::{BufMut, Bytes, BytesMut};
-use cassandra_protocol::frame::{Frame, Opcode};
+use cassandra_protocol::frame::{Direction, Flags, Frame, Opcode, Version};
 use itertools::Itertools;
 use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, Value};
 use std::borrow::Borrow;
@@ -62,7 +63,11 @@ impl SimpleRedisCache {
     }
 
     async fn get_or_update_from_cache(&mut self, mut messages: Messages) -> ChainResponse {
+        let mut stream_ids = Vec::with_capacity(messages.len());
         for message in &mut messages {
+            if let RawFrame::Cassandra(frame) = &message.original {
+                stream_ids.push(frame.stream_id);
+            }
             match &mut message.details {
                 MessageDetails::Query(ref mut qm) => {
                     let table_name = qm.namespace.join(".");
@@ -89,12 +94,29 @@ impl SimpleRedisCache {
             message.modified = true;
         }
 
-        self.cache_chain
+        let mut messages = self
+            .cache_chain
             .process_request(
                 Wrapper::new_with_chain_name(messages, self.cache_chain.name.clone()),
-                "cliebntdetailstodo".to_string(),
+                "clientdetailstodo".to_string(),
             )
-            .await
+            .await?;
+        for message in &mut messages {
+            info!("Received reply from redis cache {:?}", message);
+            // TODO: Translate the redis reply into cassandra
+            message.original = RawFrame::Cassandra(Frame {
+                version: Version::V4,
+                direction: Direction::Response,
+                flags: Flags::empty(),
+                opcode: Opcode::Result,
+                stream_id: stream_ids.remove(0),
+                body: vec![0x00, 0x00, 0x00, 0x01], // void result
+                tracing_id: None,
+                warnings: vec![],
+            });
+            message.modified = true;
+        }
+        Ok(messages)
     }
 }
 
@@ -121,23 +143,23 @@ impl ValueHelper {
     }
 }
 
-fn append_seperator(command_builder: &mut Vec<u8>) {
-    let min_size = command_builder.len();
-    let prev_char = command_builder.get_mut(min_size - 1).unwrap();
-
-    // TODO this is super fragile and depends on hidden array values to signal whether we should build the query a certain way
-    if min_size == 1 {
-        if *prev_char == b'-' {
-            *prev_char = b'['
-        } else if *prev_char == b'+' {
-            *prev_char = b']'
-        }
+fn append_prefix_min(min: &mut Vec<u8>) {
+    if min.is_empty() {
+        min.push(b'[');
     } else {
-        command_builder.push(b':');
+        min.push(b':');
     }
 }
 
-fn build_redis_commands(
+fn append_prefix_max(max: &mut Vec<u8>) {
+    if max.is_empty() {
+        max.push(b']');
+    } else {
+        max.push(b':');
+    }
+}
+
+fn build_zrangebylex_min_max_from_sql(
     expr: &Expr,
     pks: &[String],
     min: &mut Vec<u8>,
@@ -160,12 +182,10 @@ fn build_redis_commands(
                         let vh = ValueHelper(v.clone());
 
                         let mut minrv = Vec::from(vh.as_bytes());
-                        let len = minrv.len();
-
-                        let last_byte = minrv.get_mut(len - 1).unwrap();
+                        let last_byte = minrv.last_mut().unwrap();
                         *last_byte += 1;
 
-                        append_seperator(min);
+                        append_prefix_min(min);
                         min.extend(minrv.iter());
                     }
                 }
@@ -175,12 +195,10 @@ fn build_redis_commands(
                         let vh = ValueHelper(v.clone());
 
                         let mut maxrv = Vec::from(vh.as_bytes());
-                        let len = maxrv.len();
-
-                        let last_byte = maxrv.get_mut(len - 1).unwrap();
+                        let last_byte = maxrv.last_mut().unwrap();
                         *last_byte -= 1;
 
-                        append_seperator(max);
+                        append_prefix_max(max);
                         max.extend(maxrv.iter());
                     }
                 }
@@ -190,7 +208,7 @@ fn build_redis_commands(
 
                         let minrv = Vec::from(vh.as_bytes());
 
-                        append_seperator(min);
+                        append_prefix_min(min);
                         min.extend(minrv.iter());
                     }
                 }
@@ -200,7 +218,7 @@ fn build_redis_commands(
 
                         let maxrv = Vec::from(vh.as_bytes());
 
-                        append_seperator(max);
+                        append_prefix_max(max);
                         max.extend(maxrv.iter());
                     }
                 }
@@ -208,19 +226,17 @@ fn build_redis_commands(
                     if let Expr::Value(v) = right.borrow() {
                         let vh = ValueHelper(v.clone());
 
-                        let minrv = vh.as_bytes();
-                        let maxrv = minrv;
+                        let vh_bytes = vh.as_bytes();
 
-                        append_seperator(min);
-                        min.extend(minrv.iter());
-
-                        append_seperator(max);
-                        max.extend(maxrv.iter());
+                        append_prefix_min(min);
+                        append_prefix_max(max);
+                        min.extend(vh_bytes.iter());
+                        max.extend(vh_bytes.iter());
                     }
                 }
                 BinaryOperator::And => {
-                    build_redis_commands(left, pks, min, max)?;
-                    build_redis_commands(right, pks, min, max)?;
+                    build_zrangebylex_min_max_from_sql(left, pks, min, max)?;
+                    build_zrangebylex_min_max_from_sql(right, pks, min, max)?;
                 }
                 _ => {
                     return Err(anyhow!("Couldn't build query"));
@@ -245,18 +261,27 @@ fn build_redis_ast_from_sql(
             Statement::Query(q) => match &mut q.body {
                 SetExpr::Select(s) if s.selection.is_some() => {
                     let expr = s.selection.as_mut().unwrap();
-                    let mut commands_buffer: Vec<ShotoverValue> = Vec::new();
-                    let mut min: Vec<u8> = vec![b'-'];
-                    let mut max: Vec<u8> = vec![b'+'];
+                    let mut min: Vec<u8> = Vec::new();
+                    let mut max: Vec<u8> = Vec::new();
 
-                    build_redis_commands(
+                    build_zrangebylex_min_max_from_sql(
                         expr,
                         &table_cache_schema.partition_key,
                         &mut min,
                         &mut max,
                     )?;
 
-                    commands_buffer.push(ShotoverValue::Bytes("ZRANGEBYLEX".into()));
+                    let min = if min.is_empty() {
+                        Bytes::from_static(b"-")
+                    } else {
+                        Bytes::from(min)
+                    };
+                    let max = if max.is_empty() {
+                        Bytes::from_static(b"+")
+                    } else {
+                        Bytes::from(max)
+                    };
+
                     let pk = table_cache_schema
                         .partition_key
                         .iter()
@@ -265,9 +290,13 @@ fn build_redis_ast_from_sql(
                             acc.extend(v.clone().into_str_bytes());
                             acc
                         });
-                    commands_buffer.push(ShotoverValue::Bytes(pk.freeze()));
-                    commands_buffer.push(ShotoverValue::Bytes(Bytes::from(min)));
-                    commands_buffer.push(ShotoverValue::Bytes(Bytes::from(max)));
+
+                    let commands_buffer = vec![
+                        ShotoverValue::Bytes("ZRANGEBYLEX".into()),
+                        ShotoverValue::Bytes(pk.freeze()),
+                        ShotoverValue::Bytes(min),
+                        ShotoverValue::Bytes(max),
+                    ];
                     Ok(ASTHolder::Commands(ShotoverValue::List(commands_buffer)))
                 }
                 expr => Err(anyhow!("Can't build query from expr: {}", expr)),
@@ -385,8 +414,8 @@ impl Transform for SimpleRedisCache {
 
 #[cfg(test)]
 mod test {
-    use crate::message::Value as ShotoverValue;
-    use crate::message::{ASTHolder, MessageDetails, Value};
+    use crate::message::{ASTHolder, MessageDetails};
+    use crate::message::{IntSize as ShotoverValueIntSize, Value as ShotoverValue};
     use crate::protocols::cassandra_codec::CassandraCodec;
     use crate::protocols::redis_codec::{DecodeType, RedisCodec};
     use crate::transforms::chain::TransformChain;
@@ -404,7 +433,7 @@ mod test {
     fn build_query(
         query_string: &str,
         pk_col_map: &HashMap<String, Vec<String>>,
-    ) -> (ASTHolder, Option<HashMap<String, Value>>) {
+    ) -> (ASTHolder, Option<HashMap<String, ShotoverValue>>) {
         let res = CassandraCodec::parse_query_string(query_string, pk_col_map);
         (ASTHolder::SQL(Box::new(res.ast.unwrap())), res.colmap)
     }
@@ -452,7 +481,10 @@ mod test {
     #[test]
     fn equal_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
 
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string()],
@@ -478,7 +510,10 @@ mod test {
     #[test]
     fn insert_simple_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
 
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string()],
@@ -502,7 +537,10 @@ mod test {
     #[test]
     fn insert_simple_clustering_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
         pks.insert("c".to_string(), ShotoverValue::Strings("yo".to_string()));
 
         let table_cache_schema = TableCacheSchema {
@@ -529,7 +567,10 @@ mod test {
     #[test]
     fn update_simple_clustering_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
         pks.insert("c".to_string(), ShotoverValue::Strings("yo".to_string()));
 
         let table_cache_schema = TableCacheSchema {
@@ -554,7 +595,10 @@ mod test {
     #[test]
     fn check_deterministic_order_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string()],
             range_key: vec![],
@@ -587,7 +631,10 @@ mod test {
     #[test]
     fn range_exclusive_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string()],
             range_key: vec![],
@@ -612,7 +659,10 @@ mod test {
     #[test]
     fn range_inclusive_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string()],
             range_key: vec![],
@@ -637,7 +687,10 @@ mod test {
     #[test]
     fn single_pk_only_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string()],
             range_key: vec![],
@@ -659,8 +712,14 @@ mod test {
     #[test]
     fn compound_pk_only_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
-        pks.insert("y".to_string(), ShotoverValue::Integer(2));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
+        pks.insert(
+            "y".to_string(),
+            ShotoverValue::Integer(2, ShotoverValueIntSize::I32),
+        );
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string(), "y".to_string()],
             range_key: vec![],
@@ -683,7 +742,10 @@ mod test {
     #[test]
     fn open_range_test() {
         let mut pks = HashMap::new();
-        pks.insert("z".to_string(), ShotoverValue::Integer(1));
+        pks.insert(
+            "z".to_string(),
+            ShotoverValue::Integer(1, ShotoverValueIntSize::I32),
+        );
         let table_cache_schema = TableCacheSchema {
             partition_key: vec!["z".to_string()],
             range_key: vec![],

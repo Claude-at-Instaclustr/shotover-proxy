@@ -1,5 +1,4 @@
 use core::mem;
-use std::borrow::Borrow;
 use std::collections::HashMap;
 
 use anyhow::anyhow;
@@ -220,10 +219,8 @@ impl Transform for Protect {
                                         if let Some(v) = row.get_mut(*index) {
                                             if let Value::Bytes(_) = v {
                                                 let protected =
-                                                    Protected::from_encrypted_bytes_value(
-                                                        v.borrow(),
-                                                    )
-                                                    .await?;
+                                                    Protected::from_encrypted_bytes_value(v)
+                                                        .await?;
                                                 let new_value: Value = protected
                                                     .unprotect(&self.key_source, &self.key_id)
                                                     .await?;
@@ -259,7 +256,9 @@ mod protect_transform_tests {
     use cassandra_protocol::frame::{Flags, Frame, Version};
     use sodiumoxide::crypto::secretbox;
 
-    use crate::message::{Message, MessageDetails, QueryMessage, QueryResponse, QueryType, Value};
+    use crate::message::{
+        IntSize, Message, MessageDetails, QueryMessage, QueryResponse, QueryType, Value,
+    };
     use crate::protocols::cassandra_codec::CassandraCodec;
     use crate::protocols::RawFrame;
     use crate::transforms::chain::TransformChain;
@@ -305,7 +304,7 @@ mod protect_transform_tests {
             Value::Strings(String::from("cluster")),
         );
         query_values.insert(String::from("col1"), Value::Strings(secret_data.clone()));
-        query_values.insert(String::from("col2"), Value::Integer(42));
+        query_values.insert(String::from("col2"), Value::Integer(42, IntSize::I32));
         query_values.insert(String::from("col3"), Value::Boolean(true));
 
         let mut wrapper = Wrapper::new(vec!(Message::new(MessageDetails::Query(QueryMessage {
@@ -470,7 +469,7 @@ mod protect_transform_tests {
             Value::Strings(String::from("cluster")),
         );
         query_values.insert(String::from("col1"), Value::Strings(secret_data.clone()));
-        query_values.insert(String::from("col2"), Value::Integer(42));
+        query_values.insert(String::from("col2"), Value::Integer(42, IntSize::I32));
         query_values.insert(String::from("col3"), Value::Boolean(true));
 
         let mut wrapper = Wrapper::new(vec!(Message::new(MessageDetails::Query(QueryMessage {
