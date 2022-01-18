@@ -151,10 +151,13 @@ impl CassandraBloomFilter {
     }
 
     fn process_result( &mut self, query_response : & QueryResponse, stream : &StreamId) {
-        let old_msg = self.messages.get(stream)?;
-        match query_response.result.unwrap() {
-            Value::NamedRows(mut rows) => {
-                CassandraBloomFilter::remove_unwanted_data( &mut rows, &old_msg );
+        let query_msg = self.messages.remove(stream);
+        match query_msg  {
+            Some( old_msg ) =>match query_response.result.unwrap() {
+                Value::NamedRows(mut rows) => {
+                    CassandraBloomFilter::remove_unwanted_data(&mut rows, &old_msg);
+                },
+                _ => {},
             },
             _ => {},
         }
