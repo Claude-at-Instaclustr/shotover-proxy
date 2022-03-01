@@ -2548,6 +2548,7 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
+ "tree-sitter-cql",
  "uuid",
 ]
 
@@ -3027,6 +3028,25 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tree-sitter"
+version = "0.20.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e34327f8eac545e3f037382471b2b19367725a242bba7bc45edb9efb49fe39a"
+dependencies = [
+ "cc",
+ "regex",
+]
+
+[[package]]
+name = "tree-sitter-cql"
+version = "0.0.1"
+source = "git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql#24b924118a89ff43e96dd069df2e64e56741fd83"
+dependencies = [
+ "cc",
+ "tree-sitter",
 ]
 
 [[package]]

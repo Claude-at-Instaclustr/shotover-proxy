@@ -3,7 +3,7 @@ use murmur3::murmur3_x64_128;
 use crate::concurrency::FuturesOrdered;
 use crate::error::ChainResponse;
 use crate::message;
-use crate::message::{Message, MessageDetails, Messages, QueryMessage, QueryResponse, Value};
+use crate::message::{Message, Messages, QueryType};
 use crate::protocols::cassandra_codec::CassandraCodec;
 use crate::protocols::RawFrame;
 use crate::transforms::util::unordered_cluster_connection_pool::OwnedUnorderedConnectionPool;
@@ -21,48 +21,62 @@ use std::time::Duration;
 use bloomfilter::bloomfilter::hasher::{Hasher, HasherType, SimpleHasher};
 use bytes::Buf;
 use cassandra_protocol::frame::frame_result::ColType::Udt;
+use cassandra_protocol::query::QueryParams;
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot::Receiver;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tracing::{info, trace};
+use crate::codec::cassandra::CassandraCodec;
+use crate::frame::{CassandraFrame, CassandraOperation, CQL};
+use tree_sitter::{Language, Tree, TreeCursor, Node, Query, QueryCursor, QueryCapture, QueryMatch, LogType};
+use tree_sitter_cql::Parser;
+use crate::transforms::cassandra::bloom_filter::CassandraASTStatementType::{AlterKeyspace, AlterMaterializedView, AlterRole, AlterTable, AlterType, AlterUser, ApplyBatch, CreateAggregate, CreateFunction, CreateIndex, CreateKeyspace, CreateMaterializedView, CreateRole, CreateTable, CreateTrigger, CreateType, CreateUser, DeleteStatement, DropAggregate, DropFunction, DropIndex, DropKeyspace, DropMaterializedView, DropRole, DropTable, DropTrigger, DropType, DropUser, Grant, InsertStatement, ListPermissions, ListRoles, Revoke, SelectStatement, Truncate, Update, UseStatement};
 
+/// The configuration for a single bloom filter in a single table.
 #[derive(Deserialize, Debug, Clone)]
 pub struct CassandraBloomFilterTableConfig {
     #[serde(rename = "remote_address")]
+    /// keyspace for the table name
     pub keyspace: String,
+    /// the table name holding the bloom filter
     pub table: String,
+    /// the column name for the bloom filter
     pub bloomColumn: String,
+    /// the number of bits in the bloom filter
     pub bits: usize,
+    /// the number of functions in the bloom filter
     pub funcs: usize,
+    /// the names of the columns that are added to the bloom filter
     pub columns: Vec<String>,
 }
 
 
 #[derive(Debug)]
 pub struct CassandraBloomFilter {
+    /// the outbound connection for this filter
     outbound: Option<OwnedUnorderedConnectionPool<CassandraCodec>>,
-    cassandra_ks: HashMap<String, Vec<String>>,
-    bypass: bool,
+    /// the name of the chain
     chain_name: String,
+    /// a mapping of fully qualified table names to configurations.
+    /// Fully qualified => keyspace . table
     tables: HashMap<String, CassandraBloomFilterTableConfig>,
+    /// a mapping of messages by stream id.
     messages : HashMap<StreamId, QueryMessage>,
 }
 
 impl Clone for CassandraBloomFilter {
     fn clone(&self) -> Self {
-        CassandraBloomFilter::new(self.tables, self.bypass, self.chain_name.clone())
+        CassandraBloomFilter::new(&self.tables, self.chain_name.clone())
     }
 }
 
 impl CassandraBloomFilter {
-    pub fn new(tables: &HashMap<String, CassandraBloomFilterTableConfig>, bypass: bool, chain_name: String) -> CassandraBloomFilter {
+    pub fn new(tables: &HashMap<String, CassandraBloomFilterTableConfig>, chain_name: String) -> CassandraBloomFilter {
         let sink_single = CassandraBloomFilter {
-            tables,
             outbound: None,
-            cassandra_ks: HashMap::new(),
-            bypass,
             chain_name: chain_name.clone(),
+            tables: tables.clone(),
             messages : HashMap.new(),
         };
 
@@ -75,6 +89,7 @@ impl CassandraBloomFilter {
         "CassandraBloomFilter"
     }
 
+    /// Create the hasher for a string value
     fn make_hasher(value : String) -> HasherType {
         let hash_result = murmur3_x64_128(&mut Cursor::new(value), 0)?;
         let mask : u64 = (-1 : i64) as u64;
@@ -83,20 +98,60 @@ impl CassandraBloomFilter {
         SimpleHasher::new( initial, incr )
     }
 
+    /// encode the bloom filter for a blob colum in Cassandra
     fn make_filter_column( bloomFilter : Box<dyn BloomFilter> ) -> String {
         let bitMaps = bloomFilter.get_bitmaps() ;
 
         let mut parts: Vec<String> = Vec::with_capacity( bitMaps.len()+1);
-        parts.push( "0x")
+        parts.push( "0x".to_string());
         for word in bitMaps {
             parts.push( format!("{:X}", word))
         }
         parts.join("")
     }
 
-    fn process_query(&self, msg : &QueryMessage) -> msg {
+    /// process the query message.  This method has to handle all possible Queries that could
+    /// impact the Bloom filter.
+    fn process_query(&self, frame : &CassandraFrame, query: String, params: QueryParams ) -> msg {
+        let language = tree_sitter_cql::language();
+        let mut parser = tree_sitter_cql::Parser::new();
+        if parser.set_language(language).is_err() {
+            panic!("language version mismatch");
+        }
+
+        //parser.set_logger( Some( Box::new( log)) );
+        let source_code = query.as_bytes();
+        let tree = parser.parse(source_code, None).unwrap();
+        println!("{}", tree.root_node().to_sexp());
+
+        match CassandraAST::get_statement_type( tree ) {
+            SelectStatement => process_select(tree),
+            InsertStatement => process_insert(tree),
+            DeleteStatement => process_delete(tree),
+            UseStatement => process_use(tree),
+            _ => msg,
+        }
+    }
+
+    fn  process_insert( tree : Tree ) {
+        let nodes: Box<Vec<Node>> = CassandraAST::search( tree.root_node(), "insert_column_spec / column_list" );
+
+    }
+
+    fn process_delete( tree : Tree ) {
+
+    }
+
+    fn process_use( tree : Tree ) {
+
+    }
+
+    fn process_select( tree : Tree ) {
+        query.to_query_string()
+        let x = frame.operation;
+        msg.namespace()
         let fq_table_name = msg.namespace.join( ".");
-        let config = self.tables.get( f2_table_name )?;
+        let config = self.tables.get( fq_table_name )?;
         let shape = Shape {
             m : config.bits,
             k : config.funcs,
@@ -164,28 +219,33 @@ impl CassandraBloomFilter {
     }
 
     fn process_bloom_data(&mut self, messages : Messages ) -> Messages {
-        let mut newMsgs : Messages = vec![];
+        let mut new_msgs: Messages = vec![];
+
         for mut msg in messages {
-            let stream = if let RawFrame::Cassandra(frame) = &msg.original {
-                frame.stream_id
-            } else {
-                info!("no cassandra frame found");
-                newMsgs.push(msg);
+            let stream = match msg.stream_id {
+                Some(id) => id,
+                None => {
+                    info!("no cassandra frame found");
+                    new_msgs.push(msg);
+                    break;
+                }
             };
-            match msg.details {
-                MessageDetails::Query(x) => {
-                    self.messages.insert(streamId, x.clone());
-                    newMsgs.push(self.process_query(&x));
+            let frame = msg.frame().unwrap().into_cassandra().unwrap();
+
+            match frame.operation {
+                CassandraOperation::QueryType{ query, params } => {
+                    self.messages.insert(streamId, msg.clone());
+
+                    new_msgs.push(self.process_query(&frame, query.to_query_string(), params);
                 },
-                MessageDetails::Response(x) => {
-                    self.process_result(& x, &stream);
-                    msg.modified = true;
-                    newMsgs.push(msg.clone());
+                CassandraOperation::Result(result) => {
+                    self.process_result(& result, &stream);
+                    new_msgs.push(msg.clone());
                 },
-                _ => newMsgs.push(msg.clone()),
+                _ => new_msgs.push(msg.clone()),
             };
         }
-        newMsgs
+        new_msgs
     }
 
 
@@ -196,7 +256,7 @@ impl CassandraBloomFilter {
                     trace!("creating outbound connection {:?}", self.address);
                     let mut conn_pool = OwnedUnorderedConnectionPool::new(
                         self.address.clone(),
-                        CassandraCodec::new(self.cassandra_ks.clone(), self.bypass),
+                        CassandraCodec::new(),
                     );
                     // we should either connect and set the value of outbound, or return an error... so we shouldn't loop more than 2 times
                     conn_pool.connect(1).await?;
@@ -284,6 +344,137 @@ impl CassandraBloomFilter {
     }
 
 }
+
+impl CassandraAST {
+
+    // TODO move this to tree-sitter-cql or other external location.
+    pub fn search<'tree>(node : Node<'tree>, path : &'static str) -> Box<Vec<Node<'tree>>> {
+        let mut nodes = Box::new(vec!(node));
+        for segment in path.split( '/').map(|tok| tok.trim() ) {
+            let mut newNodes  = Box::new(vec!());
+            for node in nodes.iter() {
+                _find(&mut newNodes, *node, segment);
+            }
+            nodes = newNodes;
+        }
+        nodes
+    }
+
+    // TODO move this to tree-sitter-cql or other external location.
+    fn _find<'tree>(nodes : &mut Vec<Node<'tree>>, node : Node<'tree>, name : &str) {
+        if node.kind().eq(name) {
+            nodes.push( node );
+        } else {
+            if node.child_count() > 0 {
+                for childNo in 0..node.child_count() {
+                    _find( nodes, node.child( childNo ).unwrap(), name );
+                }
+            }
+        }
+    }
+
+    // TODO move this to tree-sitter-cql or other external location.
+    fn has(node : Node, path : &'static str) -> bool {
+        return ! search( node, path ).is_empty()
+    }
+
+    pub fn get_statement_type( tree : Tree ) -> CassandraASTStatementType {
+        let mut node = tree.root_node();
+        if node.kind().eq("source_file") {
+            node = node.child( 0 ).unwrap();
+        }
+        CassandraASTStatementType::from_node( node );
+    }
+}
+
+pub enum CassandraASTStatementType {
+    AlterKeyspace,
+    AlterMaterializedView,
+    AlterRole,
+    AlterTable,
+    AlterType,
+    AlterUser,
+    ApplyBatch,
+    CreateAggregate,
+    CreateFunction,
+    CreateIndex,
+    CreateKeyspace,
+    CreateMaterializedView,
+    CreateRole,
+    CreateTable,
+    CreateTrigger,
+    CreateType,
+    CreateUser,
+    DeleteStatement,
+    DropAggregate,
+    DropFunction,
+    DropIndex,
+    DropKeyspace,
+    DropMaterializedView,
+    DropRole,
+    DropTable,
+    DropTrigger,
+    DropType,
+    DropUser,
+    Grant,
+    InsertStatement,
+    ListPermissions,
+    ListRoles,
+    Revoke,
+    SelectStatement,
+    Truncate,
+    Update,
+    UseStatement,
+    UNKNOWN( String ),
+}
+
+impl CassandraASTStatementType {
+    pub fn from_node( node : Node ) -> CassandraASTStatementType {
+        match node.kind() {
+            "alter_keyspace" => AlterKeyspace,
+            "alter_materialized_view" => AlterMaterializedView,
+            "alter_role" => AlterRole,
+            "alter_table" => AlterTable,
+            "alter_type" => AlterType,
+            "alter_user" => AlterUser,
+            "apply_batch" => ApplyBatch,
+            "create_aggregate" => CreateAggregate,
+            "create_function" => CreateFunction,
+            "create_index" => CreateIndex,
+            "create_keyspace" => CreateKeyspace,
+            "create_materialized_view" => CreateMaterializedView,
+            "create_role" => CreateRole,
+            "create_table" => CreateTable,
+            "create_trigger" => CreateTrigger,
+            "create_type" => CreateType,
+            "create_user" => CreateUser,
+            "delete_statement" => DeleteStatement,
+            "drop_aggregate" => DropAggregate,
+            "drop_function" => DropFunction,
+            "drop_index" => DropIndex,
+            "drop_keyspace" => DropKeyspace,
+            "drop_materialized_view" => DropMaterializedView,
+            "drop_role" => DropRole,
+            "drop_table" => DropTable,
+            "drop_trigger" => DropTrigger,
+            "drop_type" => DropType,
+            "drop_user" => DropUser,
+            "grant" => Grant,
+            "insert_statement" => InsertStatement,
+            "list_permissions" => ListPermissions,
+            "list_roles" => ListRoles,
+            "revoke" => Revoke,
+            "select_statement" => SelectStatement,
+            "truncate" => Truncate,
+            "update" => Update,
+            "use" => UseStatement,
+            _ => CassandraASTStatementType::UNKNOWN( node.kind().to_string() )
+        }
+    }
+}
+}
+
+
 
 #[async_trait]
 impl Transform for CassandraBloomFilter {
