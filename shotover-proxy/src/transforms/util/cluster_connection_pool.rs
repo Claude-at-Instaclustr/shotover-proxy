@@ -16,6 +16,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, trace, warn, Instrument};
 
+use super::Response;
 use crate::server::Codec;
 use crate::server::CodecReadHalf;
 use crate::server::CodecWriteHalf;
@@ -176,7 +177,10 @@ impl<C: Codec + 'static, A: Authenticator<T>, T: Token> ConnectionPool<C, A, T> 
             .map_err(ConnectionError::IO)?;
 
         let mut connection = if let Some(tls) = &self.tls {
-            let tls_stream = tls.connect(stream).await.map_err(ConnectionError::TLS)?;
+            let tls_stream = tls
+                .connect_unverified_hostname(stream)
+                .await
+                .map_err(ConnectionError::TLS)?;
             let (rx, tx) = tokio::io::split(tls_stream);
             spawn_read_write_tasks(&self.codec, rx, tx)
         } else {
@@ -250,7 +254,7 @@ async fn tx_process<C: CodecWriteHalf, W: AsyncWrite + Unpin + Send + 'static>(
 ) -> Result<()> {
     let in_w = FramedWrite::new(write, codec);
     let rx_stream = UnboundedReceiverStream::new(out_rx).map(|x| {
-        let ret = Ok(vec![x.messages.clone()]);
+        let ret = Ok(vec![x.message.clone()]);
         return_tx.send(x)?;
         ret
     });
@@ -269,13 +273,16 @@ async fn rx_process<C: CodecReadHalf, R: AsyncRead + Unpin + Send + 'static>(
             Ok(req) => {
                 for m in req {
                     if let Some(Request {
-                        messages,
+                        message,
                         return_chan: Some(ret),
                         ..
                     }) = return_rx.recv().await
                     {
                         // If the receiver hangs up, just silently ignore
-                        let _ = ret.send((messages, Ok(vec![m])));
+                        let _ = ret.send(Response {
+                            original: message,
+                            response: Ok(vec![m]),
+                        });
                     }
                 }
             }
@@ -303,7 +310,7 @@ mod test {
     use tokio::time::timeout;
 
     use super::spawn_read_write_tasks;
-    use crate::protocols::redis_codec::{DecodeType, RedisCodec};
+    use crate::codec::redis::RedisCodec;
 
     #[tokio::test]
     async fn test_remote_shutdown() {
@@ -328,7 +335,7 @@ mod test {
 
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let (rx, tx) = stream.into_split();
-        let codec = RedisCodec::new(DecodeType::Response);
+        let codec = RedisCodec::new();
         let sender = spawn_read_write_tasks(&codec, rx, tx);
 
         assert!(remote.await.unwrap());
@@ -368,7 +375,7 @@ mod test {
 
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let (rx, tx) = stream.into_split();
-        let codec = RedisCodec::new(DecodeType::Response);
+        let codec = RedisCodec::new();
 
         // Drop sender immediately.
         std::mem::drop(spawn_read_write_tasks(&codec, rx, tx));

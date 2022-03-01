@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct QueryTypeFilter {
-    filter: QueryType,
+    pub filter: QueryType,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -28,9 +28,15 @@ impl Transform for QueryTypeFilter {
     async fn transform<'a>(&'a mut self, mut message_wrapper: Wrapper<'a>) -> ChainResponse {
         let removed_indexes: Vec<(usize, Message)> = message_wrapper
             .messages
-            .iter()
+            .iter_mut()
             .enumerate()
-            .filter(|(_, m)| m.get_query_type() == self.filter)
+            .filter_map(|(i, m)| {
+                if m.get_query_type() == self.filter {
+                    Some((i, m))
+                } else {
+                    None
+                }
+            })
             .map(|(i, m)| (i, m.to_filtered_reply()))
             .collect();
 
@@ -52,16 +58,16 @@ impl Transform for QueryTypeFilter {
 
 #[cfg(test)]
 mod test {
-    use crate::message::{Message, MessageDetails, QueryMessage, QueryType};
-    use crate::protocols::RawFrame;
+    use crate::frame::Frame;
+    use crate::frame::RedisFrame;
+    use crate::message::{Message, QueryType};
     use crate::transforms::filter::QueryTypeFilter;
     use crate::transforms::loopback::Loopback;
     use crate::transforms::{Transform, Transforms, Wrapper};
-    use anyhow::Result;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_filter() -> Result<()> {
-        let mut coalesce = QueryTypeFilter {
+    async fn test_filter() {
+        let mut filter_transform = QueryTypeFilter {
             filter: QueryType::Read,
         };
 
@@ -69,44 +75,47 @@ mod test {
 
         let messages: Vec<_> = (0..26)
             .map(|i| {
-                let qt = if i % 2 == 0 {
-                    QueryType::Read
+                if i % 2 == 0 {
+                    Message::from_frame(Frame::Redis(RedisFrame::Array(vec![
+                        RedisFrame::BulkString("GET".into()),
+                        RedisFrame::BulkString("key".into()),
+                    ])))
                 } else {
-                    QueryType::Write
-                };
-
-                Message::new_query(
-                    QueryMessage {
-                        query_string: "".to_string(),
-                        namespace: vec![],
-                        primary_key: Default::default(),
-                        query_values: None,
-                        projection: None,
-                        query_type: qt,
-                        ast: None,
-                    },
-                    true,
-                    RawFrame::None,
-                )
+                    Message::from_frame(Frame::Redis(RedisFrame::Array(vec![
+                        RedisFrame::BulkString("SET".into()),
+                        RedisFrame::BulkString("key".into()),
+                        RedisFrame::BulkString("value".into()),
+                    ])))
+                }
             })
             .collect();
 
         let mut message_wrapper = Wrapper::new(messages);
         message_wrapper.transforms = vec![&mut loopback];
-        let result = coalesce.transform(message_wrapper).await?;
+        let result = filter_transform.transform(message_wrapper).await.unwrap();
+
         assert_eq!(result.len(), 26);
-        let any = result.iter().find(|m| {
-            if let MessageDetails::Response(qr) = &m.details {
-                if let Some(qm) = &qr.matching_query {
-                    return qm.query_type == QueryType::Read;
+
+        for (i, mut message) in result.into_iter().enumerate() {
+            if let Some(frame) = message.frame() {
+                if i % 2 == 0 {
+                    assert_eq!(
+                        frame,
+                        &Frame::Redis(RedisFrame::Error(
+                            "ERR Message was filtered out by shotover".into()
+                        )),
+                    )
+                } else {
+                    assert_eq!(
+                        frame,
+                        &Frame::Redis(RedisFrame::Array(vec![
+                            RedisFrame::BulkString("SET".into()),
+                            RedisFrame::BulkString("key".into()),
+                            RedisFrame::BulkString("value".into()),
+                        ]))
+                    )
                 }
             }
-
-            false
-        });
-
-        assert_eq!(any, None);
-
-        Ok(())
+        }
     }
 }

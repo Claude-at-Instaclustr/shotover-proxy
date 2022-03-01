@@ -1,27 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use async_trait::async_trait;
-use derivative::Derivative;
-use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt, TryFutureExt};
-use metrics::{counter, register_counter, Unit};
-use rand::prelude::SmallRng;
-use rand::SeedableRng;
-use redis_protocol::resp2::types::Frame;
-use redis_protocol::types::Redirection;
-use serde::Deserialize;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::time::timeout;
-use tokio::time::Duration;
-use tracing::{debug, error, info, trace, warn};
-
+use crate::codec::redis::RedisCodec;
 use crate::concurrency::FuturesOrdered;
 use crate::error::ChainResponse;
-use crate::message::{Message, MessageDetails, Messages, QueryResponse};
-use crate::protocols::redis_codec::{DecodeType, RedisCodec};
-use crate::protocols::RawFrame;
+use crate::frame::{Frame, RedisFrame};
+use crate::message::Message;
 use crate::tls::TlsConfig;
 use crate::transforms::redis::RedisError;
 use crate::transforms::redis::TransformError;
@@ -30,6 +11,24 @@ use crate::transforms::util::{Request, Response};
 use crate::transforms::ResponseFuture;
 use crate::transforms::CONTEXT_CHAIN_NAME;
 use crate::transforms::{Transform, Transforms, Wrapper};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use async_trait::async_trait;
+use bytes::Bytes;
+use bytes_utils::string::Str;
+use derivative::Derivative;
+use futures::stream::FuturesUnordered;
+use futures::{Future, StreamExt, TryFutureExt};
+use metrics::{counter, register_counter};
+use rand::prelude::SmallRng;
+use rand::SeedableRng;
+use redis_protocol::types::Redirection;
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
+use tokio::time::Duration;
+use tracing::{debug, error, info, trace, warn};
 
 const SLOT_SIZE: usize = 16384;
 
@@ -91,11 +90,7 @@ impl RedisSinkCluster {
     ) -> Result<Self> {
         let authenticator = RedisAuthenticator {};
 
-        let connection_pool = ConnectionPool::new_with_auth(
-            RedisCodec::new(DecodeType::Response),
-            authenticator,
-            tls,
-        )?;
+        let connection_pool = ConnectionPool::new_with_auth(RedisCodec::new(), authenticator, tls)?;
 
         let sink_cluster = RedisSinkCluster {
             slots: SlotMap::new(),
@@ -110,7 +105,7 @@ impl RedisSinkCluster {
             token: None,
         };
 
-        register_counter!("failed_requests", Unit::Count, "chain" => chain_name, "transform" => sink_cluster.get_name());
+        register_counter!("failed_requests", "chain" => chain_name, "transform" => sink_cluster.get_name());
 
         Ok(sink_cluster)
     }
@@ -120,10 +115,11 @@ impl RedisSinkCluster {
     }
 
     #[inline]
-    async fn dispatch_message(&mut self, message: Message) -> Result<ResponseFuture> {
-        let command = match message.original {
-            RawFrame::Redis(Frame::Array(ref command)) => command,
-            _ => bail!("syntax error: bad command"),
+    async fn dispatch_message(&mut self, mut message: Message) -> Result<ResponseFuture> {
+        let command = match message.frame() {
+            Some(Frame::Redis(RedisFrame::Array(ref command))) => command,
+            None => bail!("Failed to parse redis frame"),
+            message => bail!("syntax error: bad command: {message:?}"),
         };
 
         let channels = match self.get_channels(command).await? {
@@ -163,29 +159,31 @@ impl RedisSinkCluster {
                     let response = responses
                         .fold(vec![], |mut acc, response| async move {
                             match response {
-                                Ok((_, Ok(mut messages))) => {
-                                    acc.push(messages.pop().map_or(Frame::Null, |message| {
-                                        match message.original {
-                                            RawFrame::Redis(frame) => frame,
-                                            _ => unreachable!(),
-                                        }
-                                    }))
-                                }
-                                Ok((_, Err(e))) => acc.push(Frame::Error(e.to_string())),
-                                Err(e) => acc.push(Frame::Error(e.to_string())),
+                                Ok(Response {
+                                    response: Ok(mut messages),
+                                    ..
+                                }) => acc.push(messages.pop().map_or(
+                                    RedisFrame::Null,
+                                    |mut message| match message.frame().unwrap() {
+                                        Frame::Redis(frame) => frame.take(),
+                                        _ => unreachable!(),
+                                    },
+                                )),
+                                Ok(Response {
+                                    response: Err(e), ..
+                                }) => acc.push(RedisFrame::Error(e.to_string().into())),
+                                Err(e) => acc.push(RedisFrame::Error(e.to_string().into())),
                             }
                             acc
                         })
                         .await;
 
-                    Ok((
-                        message,
-                        ChainResponse::Ok(vec![Message {
-                            details: MessageDetails::Unknown,
-                            modified: false,
-                            original: RawFrame::Redis(Frame::Array(response)),
-                        }]),
-                    ))
+                    Ok(Response {
+                        original: message,
+                        response: ChainResponse::Ok(vec![Message::from_frame(Frame::Redis(
+                            RedisFrame::Array(response),
+                        ))]),
+                    })
                 })
             }
         })
@@ -307,7 +305,7 @@ impl RedisSinkCluster {
         &mut self,
         host: &str,
         message: Message,
-    ) -> Result<oneshot::Receiver<(Message, ChainResponse)>> {
+    ) -> Result<oneshot::Receiver<Response>> {
         let (one_tx, one_rx) = oneshot::channel::<Response>();
 
         let channel = match self.channels.get_mut(host) {
@@ -373,9 +371,8 @@ impl RedisSinkCluster {
         };
 
         if let Err(e) = channel.send(Request {
-            messages: message,
+            message,
             return_chan: Some(one_tx),
-            message_id: None,
         }) {
             if let Some(error_return) = e.0.return_chan {
                 self.rebuild_connections = true;
@@ -388,7 +385,7 @@ impl RedisSinkCluster {
     }
 
     #[inline(always)]
-    async fn get_channels(&mut self, command: &[Frame]) -> Result<ChannelResult> {
+    async fn get_channels(&mut self, command: &[RedisFrame]) -> Result<ChannelResult> {
         Ok(match RoutingInfo::for_command_frame(command)? {
             Some(RoutingInfo::Slot(slot)) => ChannelResult::Channels(
                 if let Some((_, lookup)) = self.slots.masters.range(&slot..).next() {
@@ -416,9 +413,9 @@ impl RedisSinkCluster {
         })
     }
 
-    async fn on_auth(&mut self, command: &[Frame]) -> Result<ResponseFuture> {
+    async fn on_auth(&mut self, command: &[RedisFrame]) -> Result<ResponseFuture> {
         let mut args = command.iter().skip(1).rev().map(|f| match f {
-            Frame::BulkString(s) => Ok(s),
+            RedisFrame::BulkString(s) => Ok(s),
             _ => bail!("syntax error: expected bulk string"),
         });
 
@@ -465,7 +462,7 @@ impl RedisSinkCluster {
     }) {
         error!("failed to count failed request - missing chain name: {}", e);
     }
-        send_frame_response(one_tx, Frame::Error(message.to_string()))
+        send_frame_response(one_tx, RedisFrame::Error(message.to_string().into()))
             .map_err(|_| anyhow!("failed to send error: {}", message))
     }
 
@@ -545,9 +542,9 @@ enum ChannelResult {
 
 impl RoutingInfo {
     #[inline(always)]
-    pub fn for_command_frame(args: &[Frame]) -> Result<Option<RoutingInfo>> {
+    pub fn for_command_frame(args: &[RedisFrame]) -> Result<Option<RoutingInfo>> {
         let command_name = match args.get(0) {
-            Some(Frame::BulkString(command_name)) => command_name.to_ascii_uppercase(),
+            Some(RedisFrame::BulkString(command_name)) => command_name.to_ascii_uppercase(),
             _ => bail!("syntax error: bad command name"),
         };
 
@@ -561,11 +558,13 @@ impl RoutingInfo {
             b"EVALSHA" | b"EVAL" => {
                 //TODO: Appears the the codec is not decoding integers correctly
                 match args.get(2) {
-                    Some(Frame::Integer(key_count)) => Some(*key_count),
-                    Some(Frame::BulkString(key_count)) => String::from_utf8(key_count.to_vec())
-                        .unwrap_or_else(|_| "0".to_string())
-                        .parse::<i64>()
-                        .ok(),
+                    Some(RedisFrame::Integer(key_count)) => Some(*key_count),
+                    Some(RedisFrame::BulkString(key_count)) => {
+                        String::from_utf8(key_count.to_vec())
+                            .unwrap_or_else(|_| "0".to_string())
+                            .parse::<i64>()
+                            .ok()
+                    }
                     _ => None,
                 }
                 .and_then(|key_count| {
@@ -580,7 +579,7 @@ impl RoutingInfo {
             b"XREAD" | b"XREADGROUP" => args
                 .iter()
                 .position(|a| match a {
-                    Frame::BulkString(a) => a.to_ascii_uppercase() == b"STREAMS",
+                    RedisFrame::BulkString(a) => a.to_ascii_uppercase() == b"STREAMS",
                     _ => false,
                 })
                 .and_then(|streams_position| {
@@ -596,8 +595,8 @@ impl RoutingInfo {
     }
 
     #[inline(always)]
-    pub fn for_key(key: &Frame) -> Option<RoutingInfo> {
-        if let Frame::BulkString(key) = key {
+    pub fn for_key(key: &RedisFrame) -> Option<RoutingInfo> {
+        if let RedisFrame::BulkString(key) = key {
             let key = get_hashtag(key).unwrap_or(key);
             Some(RoutingInfo::Slot(
                 crc16::State::<crc16::XMODEM>::calculate(key) % SLOT_SIZE as u16,
@@ -609,7 +608,7 @@ impl RoutingInfo {
 }
 
 fn build_slot_to_server(
-    frames: &[Frame],
+    frames: &[RedisFrame],
     slot_entries: &mut Vec<(String, u16, u16)>,
     start: u16,
     end: u16,
@@ -617,7 +616,7 @@ fn build_slot_to_server(
     ensure!(start <= end, "invalid slot range: {}-{}", start, end);
     ensure!(frames.len() >= 2, "expected at least two fields");
 
-    let ip = if let Frame::BulkString(ref ip) = frames[0] {
+    let ip = if let RedisFrame::BulkString(ref ip) = frames[0] {
         String::from_utf8_lossy(ip.as_ref()).to_string()
     } else {
         bail!("unexpected type for ip");
@@ -628,36 +627,36 @@ fn build_slot_to_server(
         return Ok(());
     }
 
-    let port = if let Frame::Integer(port) = frames[1] {
+    let port = if let RedisFrame::Integer(port) = frames[1] {
         port
     } else {
         bail!("unexpected type for port");
     };
 
-    slot_entries.push((format!("{}:{}", ip, port), start, end));
+    slot_entries.push((format!("{ip}:{port}"), start, end));
 
     Ok(())
 }
 
-pub fn parse_slots(results: &[Frame]) -> Result<SlotMap> {
+pub fn parse_slots(results: &[RedisFrame]) -> Result<SlotMap> {
     let mut master_entries: Vec<(String, u16, u16)> = vec![];
     let mut replica_entries: Vec<(String, u16, u16)> = vec![];
 
     for result in results {
         match result {
-            Frame::Array(result) => {
+            RedisFrame::Array(result) => {
                 let mut start: u16 = 0;
                 let mut end: u16 = 0;
 
                 for (index, item) in result.iter().enumerate() {
                     match (index, item) {
-                        (0, Frame::Integer(i)) => start = *i as u16,
-                        (1, Frame::Integer(i)) => end = *i as u16,
-                        (2, Frame::Array(master)) => {
+                        (0, RedisFrame::Integer(i)) => start = *i as u16,
+                        (1, RedisFrame::Integer(i)) => end = *i as u16,
+                        (2, RedisFrame::Array(master)) => {
                             build_slot_to_server(master, &mut master_entries, start, end)
                                 .context("failed to decode master slots")?
                         }
-                        (_, Frame::Array(replica)) => {
+                        (_, RedisFrame::Array(replica)) => {
                             build_slot_to_server(replica, &mut replica_entries, start, end)
                                 .context("failed to decode replica slots")?;
                         }
@@ -681,22 +680,21 @@ async fn get_topology_from_node(
 ) -> Result<SlotMap, TransformError> {
     let return_chan_rx = send_frame_request(
         &sender,
-        Frame::Array(vec![
-            Frame::BulkString(b"CLUSTER".to_vec()),
-            Frame::BulkString(b"SLOTS".to_vec()),
+        RedisFrame::Array(vec![
+            RedisFrame::BulkString("CLUSTER".into()),
+            RedisFrame::BulkString("SLOTS".into()),
         ]),
     )?;
 
     match receive_frame_response(return_chan_rx).await? {
-        Frame::Array(results) => {
+        RedisFrame::Array(results) => {
             parse_slots(&results).map_err(|e| TransformError::Protocol(e.to_string()))
         }
-        Frame::Error(message) => Err(TransformError::Upstream(RedisError::from_message(
-            message.as_str(),
-        ))),
+        RedisFrame::Error(message) => {
+            Err(TransformError::Upstream(RedisError::from_message(&message)))
+        }
         frame => Err(TransformError::Protocol(format!(
-            "unexpected response for cluster slots: {:?}",
-            frame
+            "unexpected response for cluster slots: {frame:?}"
         ))),
     }
 }
@@ -716,55 +714,48 @@ fn get_hashtag(key: &[u8]) -> Option<&[u8]> {
 
 #[inline(always)]
 fn send_simple_response(one_tx: oneshot::Sender<Response>, message: &str) -> Result<()> {
-    send_frame_response(one_tx, Frame::SimpleString(message.to_string()))
+    send_frame_response(one_tx, RedisFrame::SimpleString(message.to_string().into()))
         .map_err(|_| anyhow!("failed to send simple: {}", message))
 }
 
 #[inline(always)]
 fn send_frame_request(
     sender: &UnboundedSender<Request>,
-    frame: Frame,
-) -> Result<oneshot::Receiver<(Message, Result<Messages>)>> {
+    frame: RedisFrame,
+) -> Result<oneshot::Receiver<Response>> {
     let (return_chan_tx, return_chan_rx) = oneshot::channel();
 
     sender.send(Request {
-        messages: Message {
-            details: MessageDetails::Unknown,
-            modified: false,
-            original: RawFrame::Redis(frame),
-        },
+        message: Message::from_frame(Frame::Redis(frame)),
         return_chan: Some(return_chan_tx),
-        message_id: None,
     })?;
 
     Ok(return_chan_rx)
 }
 
 #[inline(always)]
-async fn receive_frame_response(
-    receiver: oneshot::Receiver<(Message, Result<Messages>)>,
-) -> Result<Frame> {
-    let (_, result) = receiver.await?;
+async fn receive_frame_response(receiver: oneshot::Receiver<Response>) -> Result<RedisFrame> {
+    let Response { response, .. } = receiver.await?;
 
     // Exactly one Redis response is guaranteed by the codec on success.
-    let message = result?.pop().unwrap().original;
+    let mut message = response?.pop().unwrap();
 
-    match message {
-        RawFrame::Redis(frame) => Ok(frame),
-        _ => unreachable!(),
+    match message.frame() {
+        Some(Frame::Redis(frame)) => Ok(frame.take()),
+        None => Err(anyhow!("Failed to parse redis frame")),
+        response => Err(anyhow!("Unexpected redis response: {response:?}")),
     }
 }
 
 #[inline(always)]
-fn send_frame_response(one_tx: oneshot::Sender<Response>, frame: Frame) -> Result<(), Response> {
-    one_tx.send((
-        Message::new_raw(RawFrame::None),
-        Ok(vec![Message::new(
-            MessageDetails::Response(QueryResponse::empty()),
-            false,
-            RawFrame::Redis(frame),
-        )]),
-    ))
+fn send_frame_response(
+    one_tx: oneshot::Sender<Response>,
+    frame: RedisFrame,
+) -> Result<(), Response> {
+    one_tx.send(Response {
+        original: Message::from_frame(Frame::None),
+        response: Ok(vec![Message::from_frame(Frame::Redis(frame))]),
+    })
 }
 
 fn immediate_responder() -> (
@@ -797,7 +788,7 @@ impl Transform for RedisSinkCluster {
                 Ok(response) => response,
                 Err(e) => {
                     let (one_tx, one_rx) = immediate_responder();
-                    self.send_error_response(one_tx, &format!("ERR {}", e))?;
+                    self.send_error_response(one_tx, &format!("ERR {e}"))?;
                     Box::pin(one_rx)
                 }
             });
@@ -808,21 +799,21 @@ impl Transform for RedisSinkCluster {
 
         while let Some(s) = responses.next().await {
             trace!("Got resp {:?}", s);
-            let (original, response) = s.or_else(|_| -> Result<(_, _)> {
-                Ok((
-                    Message::new_raw(RawFrame::None),
-                    Ok(vec![Message::new(
-                        MessageDetails::Response(QueryResponse::empty()),
-                        false,
-                        RawFrame::Redis(Frame::Error("ERR Could not route request".to_string())),
-                    )]),
-                ))
+            let Response { original, response } = s.or_else(|_| -> Result<Response> {
+                Ok(Response {
+                    original: Message::from_frame(Frame::None),
+                    response: Ok(vec![Message::from_frame(Frame::Redis(RedisFrame::Error(
+                        Str::from_inner(Bytes::from_static(b"ERR Could not route request"))
+                            .unwrap(),
+                    )))]),
+                })
             })?;
+
             let mut response = response?;
             assert_eq!(response.len(), 1);
-            let response_m = response.remove(0);
-            match &response_m.original {
-                RawFrame::Redis(frame) => {
+            let mut response_m = response.remove(0);
+            match response_m.frame() {
+                Some(Frame::Redis(frame)) => {
                     match frame.to_redirection() {
                         Some(Redirection::Moved { slot, server }) => {
                             debug!("Got MOVE {} {}", slot, server);
@@ -860,11 +851,11 @@ impl Transform for RedisSinkCluster {
 #[derive(Clone, PartialEq, Eq, Hash, Derivative)]
 #[derivative(Debug)]
 pub struct UsernamePasswordToken {
-    pub username: Option<Vec<u8>>,
+    pub username: Option<Bytes>,
 
     // Reduce risk of logging passwords.
     #[derivative(Debug = "ignore")]
-    pub password: Vec<u8>,
+    pub password: Bytes,
 }
 
 #[derive(Clone)]
@@ -879,30 +870,28 @@ impl Authenticator<UsernamePasswordToken> for RedisAuthenticator {
         sender: &mut UnboundedSender<Request>,
         token: &UsernamePasswordToken,
     ) -> Result<(), TransformError> {
-        let mut auth_args = vec![Frame::BulkString(b"AUTH".to_vec())];
+        let mut auth_args = vec![RedisFrame::BulkString(Bytes::from_static(b"AUTH"))];
 
         // Support non-ACL / username-less.
         if let Some(username) = &token.username {
-            auth_args.push(Frame::BulkString(username.clone()));
+            auth_args.push(RedisFrame::BulkString(username.clone()));
         }
 
-        auth_args.push(Frame::BulkString(token.password.clone()));
+        auth_args.push(RedisFrame::BulkString(token.password.clone()));
 
-        let return_rx = send_frame_request(sender, Frame::Array(auth_args))?;
+        let return_rx = send_frame_request(sender, RedisFrame::Array(auth_args))?;
 
         match receive_frame_response(return_rx).await? {
-            Frame::SimpleString(s) if s == "OK" => {
+            RedisFrame::SimpleString(s) if s == "OK" => {
                 trace!("authenticated upstream as user: {:?}", token.username);
                 Ok(())
             }
-            Frame::SimpleString(s) => Err(TransformError::Protocol(format!(
-                "expected OK but got: {}",
-                s
+            RedisFrame::SimpleString(s) => Err(TransformError::Protocol(format!(
+                "expected OK but got: {s:?}"
             ))),
-            Frame::Error(e) => Err(TransformError::Upstream(RedisError::from_message(&e))),
+            RedisFrame::Error(e) => Err(TransformError::Upstream(RedisError::from_message(&e))),
             f => Err(TransformError::Protocol(format!(
-                "unexpected response type: {:?}",
-                f
+                "unexpected response type: {f:?}"
             ))),
         }
     }
@@ -917,23 +906,21 @@ mod test {
         // Wireshark capture from a Redis cluster with 3 masters and 3 replicas.
         let slots_pcap: &[u8] = b"*3\r\n*4\r\n:10923\r\n:16383\r\n*3\r\n$12\r\n192.168.80.6\r\n:6379\r\n$40\r\n3a7c357ed75d2aa01fca1e14ef3735a2b2b8ffac\r\n*3\r\n$12\r\n192.168.80.3\r\n:6379\r\n$40\r\n77c01b0ddd8668fff05e3f6a8aaf5f3ccd454a79\r\n*4\r\n:5461\r\n:10922\r\n*3\r\n$12\r\n192.168.80.5\r\n:6379\r\n$40\r\n969c6215d064e68593d384541ceeb57e9520dbed\r\n*3\r\n$12\r\n192.168.80.2\r\n:6379\r\n$40\r\n3929f69990a75be7b2d49594c57fe620862e6fd6\r\n*4\r\n:0\r\n:5460\r\n*3\r\n$12\r\n192.168.80.7\r\n:6379\r\n$40\r\n15d52a65d1fc7a53e34bf9193415aa39136882b2\r\n*3\r\n$12\r\n192.168.80.4\r\n:6379\r\n$40\r\ncd023916a3528fae7e606a10d8289a665d6c47b0\r\n";
 
-        let mut codec = RedisCodec::new(DecodeType::Response);
+        let mut codec = RedisCodec::new();
 
-        let raw_frame = codec
+        let mut message = codec
             .decode(&mut slots_pcap.into())
             .unwrap()
             .unwrap()
             .pop()
-            .unwrap()
-            .original;
+            .unwrap();
 
-        let slots_frames = if let RawFrame::Redis(Frame::Array(frames)) = raw_frame {
-            frames
-        } else {
-            panic!("bad input: {:?}", raw_frame)
+        let slots_frames = match message.frame().unwrap() {
+            Frame::Redis(RedisFrame::Array(frames)) => frames,
+            frame => panic!("bad input: {frame:?}"),
         };
 
-        let slots = parse_slots(&slots_frames).unwrap();
+        let slots = parse_slots(slots_frames).unwrap();
 
         let nodes = vec![
             "192.168.80.2:6379",

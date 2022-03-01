@@ -1,10 +1,10 @@
-use crate::message::{Message, MessageDetails, Messages};
+use crate::message::Messages;
 use crate::tls::TlsAcceptor;
 use crate::transforms::chain::TransformChain;
 use crate::transforms::Wrapper;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use metrics::{gauge, register_gauge, Unit};
+use metrics::{register_gauge, Gauge};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,29 +27,24 @@ impl<T: Decoder<Item = Messages, Error = anyhow::Error> + Clone + Send> CodecRea
 pub trait CodecWriteHalf: Encoder<Messages, Error = anyhow::Error> + Clone + Send {}
 impl<T: Encoder<Messages, Error = anyhow::Error> + Clone + Send> CodecWriteHalf for T {}
 
-fn perform_custom_handling(messages: Messages, tx_out: &UnboundedSender<Messages>) -> Messages {
-    // this code creates a new Vec and uses an iterator with mapping and filtering to
-    // populate it from the original Messages.message Vec.  Any messages that require special
-    // handling are processed here.  Specifically messages with ReturnToSender details.
-    let result = messages
+fn process_return_to_sender_messages(
+    messages: Messages,
+    tx_out: &UnboundedSender<Messages>,
+) -> Messages {
+    #[allow(clippy::unnecessary_filter_map)]
+    messages
         .into_iter()
-        .map(|m| {
-            // if there is a protocol error handle it and return a new ReturnToSender message
-            // it will be filtered out in the next step.
-            if m.details == MessageDetails::ReturnToSender {
-                debug!("processing ReturnToSender: {:?}", &m);
+        .filter_map(|m| {
+            if m.return_to_sender {
                 if let Err(err) = tx_out.send(vec![m]) {
                     error!("Failed to send return to sender message: {:?}", err);
                 }
-                Message::new_no_original(MessageDetails::ReturnToSender, true)
+                None
             } else {
-                m
+                Some(m)
             }
         })
-        .filter(|m| m.details != MessageDetails::ReturnToSender)
-        .collect();
-    debug!("perform_custom_handling returning: {:?}", &result);
-    result
+        .collect()
 }
 
 // TODO: Replace with trait_alias (rust-lang/rust#41517).
@@ -99,6 +94,8 @@ pub struct TcpCodecListener<C: Codec> {
 
     /// Keep track of how many messages we have received so we can use it as a request id.
     message_count: u64,
+
+    available_connections_gauge: Gauge,
 }
 
 impl<C: Codec + 'static> TcpCodecListener<C> {
@@ -113,8 +110,9 @@ impl<C: Codec + 'static> TcpCodecListener<C> {
         trigger_shutdown_rx: watch::Receiver<bool>,
         tls: Option<TlsAcceptor>,
     ) -> Self {
-        register_gauge!("shotover_available_connections", Unit::Count, "source" => source_name.clone());
-        gauge!("shotover_available_connections", limit_connections.available_permits() as f64, "source" => source_name.clone());
+        let available_connections_gauge =
+            register_gauge!("shotover_available_connections", "source" => source_name.clone());
+        available_connections_gauge.set(limit_connections.available_permits() as f64);
 
         TcpCodecListener {
             chain,
@@ -127,6 +125,7 @@ impl<C: Codec + 'static> TcpCodecListener<C> {
             trigger_shutdown_rx,
             tls,
             message_count: 0,
+            available_connections_gauge,
         }
     }
 
@@ -189,7 +188,8 @@ impl<C: Codec + 'static> TcpCodecListener<C> {
             let socket = self.accept().await?;
 
             debug!("got socket");
-            gauge!("shotover_available_connections", self.limit_connections.available_permits() as f64, "source" => self.source_name.clone());
+            self.available_connections_gauge
+                .set(self.limit_connections.available_permits() as f64);
 
             let peer = socket
                 .peer_addr()
@@ -363,10 +363,10 @@ fn spawn_read_write_tasks<
             while let Some(message) = reader.next().await {
                 match message {
                     Ok(message) => {
-                        let filtered_messages = perform_custom_handling(message, &out_tx);
-                        debug!("filtered_messages: {:?}", filtered_messages);
-                        if !filtered_messages.is_empty() {
-                            if let Err(error) = in_tx.send(filtered_messages) {
+                        let remaining_messages =
+                            process_return_to_sender_messages(message, &out_tx);
+                        if !remaining_messages.is_empty() {
+                            if let Err(error) = in_tx.send(remaining_messages) {
                                 warn!("failed to send message: {}", error);
                                 return;
                             }

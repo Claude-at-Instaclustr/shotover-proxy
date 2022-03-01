@@ -1,10 +1,12 @@
 use anyhow::Result;
+use cassandra_cpp::{Cluster, Session, Ssl};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use redis::aio::AsyncStream;
 use redis::Client;
 use shotover_proxy::runner::{ConfigOpts, Runner};
 use shotover_proxy::tls::{TlsConfig, TlsConnector};
+use std::fs::read_to_string;
 use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -39,9 +41,9 @@ impl ShotoverManager {
             ..ConfigOpts::default()
         };
         let spawn = Runner::new(opts)
-            .unwrap_or_else(|x| panic!("{} occurred processing {:?}", x, topology_path))
+            .unwrap_or_else(|x| panic!("{x} occurred processing {topology_path:?}"))
             .with_observability_interface()
-            .unwrap_or_else(|x| panic!("{} occurred processing {:?}", x, topology_path))
+            .unwrap_or_else(|x| panic!("{x} occurred processing {topology_path:?}"))
             .run_spawn();
 
         // If we allow the tracing_guard to be dropped then the following tests in the same file will not get tracing so we mem::forget it.
@@ -64,7 +66,7 @@ impl ShotoverManager {
             ..ConfigOpts::default()
         };
         let spawn = Runner::new(opts)
-            .unwrap_or_else(|x| panic!("{} occurred processing {:?}", x, topology_path))
+            .unwrap_or_else(|x| panic!("{x} occurred processing {topology_path:?}"))
             .run_spawn();
 
         // If we allow the tracing_guard to be dropped then the following tests in the same file will not get tracing so we mem::forget it.
@@ -128,7 +130,10 @@ impl ShotoverManager {
             .await
             .unwrap();
         let connector = TlsConnector::new(config).unwrap();
-        let tls_stream = connector.connect(tcp_stream).await.unwrap();
+        let tls_stream = connector
+            .connect_unverified_hostname(tcp_stream)
+            .await
+            .unwrap();
 
         let connection_info = Default::default();
         redis::aio::Connection::new(
@@ -137,6 +142,44 @@ impl ShotoverManager {
         )
         .await
         .unwrap()
+    }
+
+    #[allow(unused)]
+    pub fn cassandra_connection(&self, contact_points: &str, port: u16) -> Session {
+        for contact_point in contact_points.split(',') {
+            wait_for_socket_to_open(contact_point, port);
+        }
+        let mut cluster = Cluster::default();
+        cluster.set_contact_points(contact_points).unwrap();
+        cluster.set_port(port).ok();
+        cluster.set_load_balance_round_robin();
+        cluster.connect().unwrap()
+    }
+
+    #[allow(unused)]
+    pub fn cassandra_connection_tls(
+        &self,
+        contact_points: &str,
+        port: u16,
+        ca_cert_path: &str,
+        username: &str,
+        password: &str,
+    ) -> Session {
+        let ca_cert = read_to_string(ca_cert_path).unwrap();
+        let mut ssl = Ssl::default();
+        Ssl::add_trusted_cert(&mut ssl, &ca_cert).unwrap();
+
+        for contact_point in contact_points.split(',') {
+            crate::helpers::wait_for_socket_to_open(contact_point, port);
+        }
+
+        let mut cluster = Cluster::default();
+        cluster.set_credentials(username, password).unwrap();
+        cluster.set_contact_points(contact_points).unwrap();
+        cluster.set_port(port).ok();
+        cluster.set_load_balance_round_robin();
+        cluster.set_ssl(&mut ssl);
+        cluster.connect().unwrap()
     }
 
     fn shutdown_shotover(&mut self) -> Result<()> {
@@ -155,7 +198,7 @@ impl Drop for ShotoverManager {
         if std::thread::panicking() {
             // If already panicking do not panic while attempting to shutdown shotover in order to avoid a double panic.
             if let Err(err) = self.shutdown_shotover() {
-                println!("Failed to shutdown shotover: {}", err)
+                println!("Failed to shutdown shotover: {err}")
             }
         } else {
             self.shutdown_shotover().unwrap();
@@ -174,7 +217,7 @@ impl Drop for ShotoverProcess {
             if let Err(err) =
                 nix::sys::signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGKILL)
             {
-                println!("Failed to shutdown ShotoverProcess {}", err);
+                println!("Failed to shutdown ShotoverProcess {err}");
             }
         }
     }
@@ -183,7 +226,21 @@ impl Drop for ShotoverProcess {
 impl ShotoverProcess {
     #[allow(unused)]
     pub fn new(topology_path: &str) -> ShotoverProcess {
-        // Set in build.rs from PROFILE listed in https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts
+        // First ensure shotover is fully built so that the potentially lengthy build time is not included in the wait_for_socket_to_open timeout
+        // PROFILE is set in build.rs from PROFILE listed in https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts
+        let all_args = if env!("PROFILE") == "release" {
+            vec!["build", "--release"]
+        } else {
+            vec!["build"]
+        };
+        assert!(Command::new(env!("CARGO"))
+            .args(&all_args)
+            .stdout(Stdio::piped())
+            .status()
+            .unwrap()
+            .success());
+
+        // Now actually run shotover and keep hold of the child process
         let all_args = if env!("PROFILE") == "release" {
             vec!["run", "--release", "--", "-t", topology_path]
         } else {

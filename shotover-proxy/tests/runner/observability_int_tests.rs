@@ -9,7 +9,7 @@ async fn http_request_metrics() -> String {
 fn assert_array_elems(expected: &[&str], result: String) {
     for s in expected {
         if !result.contains(s) {
-            panic!("{} missing from response: \n{}", s, result);
+            panic!("{s} missing from response: \n{result}");
         }
     }
 }
@@ -79,20 +79,20 @@ async fn test_metrics() {
         .arg(42)
         .query_async::<_, ()>(&mut connection)
         .await
-        .unwrap();
+        .unwrap_err();
 
     redis::cmd("SET")
         .arg("the_key")
         .arg(43)
         .query_async::<_, ()>(&mut connection)
         .await
-        .unwrap();
+        .unwrap_err();
 
     redis::cmd("GET")
         .arg("the_key")
         .query_async::<_, ()>(&mut connection)
         .await
-        .unwrap();
+        .unwrap_err();
 
     body = http_request_metrics().await;
 
@@ -100,6 +100,8 @@ async fn test_metrics() {
     // due to the randomized order of the labels. Will need to parse the prometheus output
 
     let new_lines = vec![
+        r#"query_count{type="redis",name="redis-chain",query="GET"} 1"#,
+        r#"query_count{type="redis",name="redis-chain",query="SET"} 2"#,
         r#"shotover_chain_latency{chain="redis_chain",client_details="127.0.0.1",quantile="0"}"#,
         r#"shotover_chain_latency{chain="redis_chain",client_details="127.0.0.1",quantile="0.5"}"#,
         r#"shotover_chain_latency{chain="redis_chain",client_details="127.0.0.1",quantile="0.9"}"#,
@@ -111,7 +113,8 @@ async fn test_metrics() {
         r#"shotover_chain_latency_count{chain="redis_chain",client_details="127.0.0.1"}"#,
     ];
 
-    let count= body.lines().count();
+
+    let count = body.lines().count();
     // report missing rows before counting rows -- aids in debugging
     assert_array_elems(&expected, body);
 

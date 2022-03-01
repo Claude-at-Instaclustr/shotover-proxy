@@ -10,7 +10,6 @@
 //!
 //! ## Messages
 //! * [`message::Message`], the main struct that carries database queries/frames around in Shotover.
-//! * [`message::MessageDetails`], an enriched struct that contains computed, easy to work with information about the message.
 //!
 //! ## Transform
 //! * [`transforms::Wrapper`], used to wrap messages as they traverse the [`transforms::Transform`] chain.
@@ -19,11 +18,12 @@
 //! * [`transforms::TransformsConfig`], the enum to register with (add a variant) for configuring your own transform.
 
 mod admin;
+pub mod codec;
 mod concurrency;
 pub mod config;
 pub mod error;
+pub mod frame;
 pub mod message;
-pub mod protocols;
 pub mod runner;
 mod server;
 pub mod sources;

@@ -1,24 +1,22 @@
 use crate::config::topology::TopicHolder;
 use crate::error::ChainResponse;
-use crate::message::{Message, QueryResponse, Value};
-use crate::protocols::RawFrame;
 use crate::transforms::chain::BufferedChain;
 use crate::transforms::{
     build_chain_from_config, Transform, Transforms, TransformsConfig, Wrapper,
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use metrics::{counter, register_counter, Unit};
+use metrics::{register_counter, Counter};
 use serde::Deserialize;
 use tracing::trace;
 
-#[derive(Debug)]
 pub struct Tee {
     pub tx: BufferedChain,
     pub mismatch_chain: Option<BufferedChain>,
     pub buffer_size: usize,
     pub behavior: ConsistencyBehavior,
     pub timeout_micros: Option<u64>,
+    dropped_messages: Counter,
 }
 
 impl Clone for Tee {
@@ -32,6 +30,7 @@ impl Clone for Tee {
             buffer_size: self.buffer_size,
             behavior: self.behavior.clone(),
             timeout_micros: self.timeout_micros,
+            dropped_messages: self.dropped_messages.clone(),
         }
     }
 }
@@ -85,17 +84,16 @@ impl Tee {
         behavior: ConsistencyBehavior,
         timeout_micros: Option<u64>,
     ) -> Self {
-        let tee = Tee {
+        let dropped_messages = register_counter!("tee_dropped_messages", "chain" => "Tee");
+
+        Tee {
             tx,
             mismatch_chain,
             buffer_size,
             behavior,
             timeout_micros,
-        };
-
-        register_counter!("tee_dropped_messages", Unit::Count, "chain" => tee.get_name());
-
-        tee
+            dropped_messages,
+        }
     }
 }
 
@@ -113,7 +111,7 @@ impl Transform for Tee {
                 .original_chain
                 .validate()
                 .iter()
-                .map(|x| format!("  {}", x))
+                .map(|x| format!("  {x}"))
                 .collect::<Vec<String>>();
 
             if !errors.is_empty() {
@@ -137,7 +135,7 @@ impl Transform for Tee {
                 match tee_result {
                     Ok(_) => {}
                     Err(e) => {
-                        counter!("tee_dropped_messages", 1, "chain" => self.get_name());
+                        self.dropped_messages.increment(1);
                         trace!("MPSC error {}", e);
                     }
                 }
@@ -150,20 +148,15 @@ impl Transform for Tee {
                     message_wrapper.call_next_transform()
                 );
                 let tee_response = tee_result?;
-                let chain_response = chain_result?;
+                let mut chain_response = chain_result?;
 
                 if !chain_response.eq(&tee_response) {
-                    Ok(vec!(Message::new_response(
-                        QueryResponse::empty_with_error(Some(Value::Strings(
-                            "ERR The responses from the Tee subchain and down-chain did not match and behavior is set to fail on mismatch"
-                                .to_string(),
-                        ))),
-                        true,
-                        RawFrame::None,
-                    )))
-                } else {
-                    Ok(chain_response)
+                    for message in &mut chain_response {
+                        message.set_error(
+                                "ERR The responses from the Tee subchain and down-chain did not match and behavior is set to fail on mismatch".into())
+                    }
                 }
+                Ok(chain_response)
             }
             ConsistencyBehavior::SubchainOnMismatch(_) => {
                 let failed_message = message_wrapper.clone();

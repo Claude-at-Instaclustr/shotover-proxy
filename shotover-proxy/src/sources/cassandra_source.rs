@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -9,19 +8,19 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
+use crate::codec::cassandra::CassandraCodec;
 use crate::config::topology::TopicHolder;
-use crate::protocols::cassandra_codec::CassandraCodec;
 use crate::server::TcpCodecListener;
 use crate::sources::{Sources, SourcesFromConfig};
+use crate::tls::{TlsAcceptor, TlsConfig};
 use crate::transforms::chain::TransformChain;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct CassandraConfig {
     pub listen_addr: String,
-    pub cassandra_ks: HashMap<String, Vec<String>>,
-    pub query_processing: Option<bool>,
     pub connection_limit: Option<usize>,
     pub hard_connection_limit: Option<bool>,
+    pub tls: Option<TlsConfig>,
 }
 
 #[async_trait]
@@ -36,13 +35,12 @@ impl SourcesFromConfig for CassandraConfig {
             CassandraSource::new(
                 chain,
                 self.listen_addr.clone(),
-                self.cassandra_ks.clone(),
                 trigger_shutdown_rx,
-                self.query_processing.unwrap_or(false),
                 self.connection_limit,
                 self.hard_connection_limit,
+                self.tls.clone(),
             )
-            .await,
+            .await?,
         )])
     }
 }
@@ -59,12 +57,11 @@ impl CassandraSource {
     pub async fn new(
         chain: &TransformChain,
         listen_addr: String,
-        cassandra_ks: HashMap<String, Vec<String>>,
         mut trigger_shutdown_rx: watch::Receiver<bool>,
-        query_processing: bool,
         connection_limit: Option<usize>,
         hard_connection_limit: Option<bool>,
-    ) -> CassandraSource {
+        tls: Option<TlsConfig>,
+    ) -> Result<CassandraSource> {
         let name = "CassandraSource";
 
         info!("Starting Cassandra source on [{}]", listen_addr);
@@ -74,10 +71,10 @@ impl CassandraSource {
             name.to_string(),
             listen_addr.clone(),
             hard_connection_limit.unwrap_or(false),
-            CassandraCodec::new(cassandra_ks, !query_processing),
+            CassandraCodec::new(),
             Arc::new(Semaphore::new(connection_limit.unwrap_or(512))),
             trigger_shutdown_rx.clone(),
-            None,
+            tls.map(TlsAcceptor::new).transpose()?,
         );
 
         let join_handle = Handle::current().spawn(async move {
@@ -98,10 +95,10 @@ impl CassandraSource {
             Ok(())
         });
 
-        CassandraSource {
+        Ok(CassandraSource {
             name,
             join_handle,
             listen_addr,
-        }
+        })
     }
 }

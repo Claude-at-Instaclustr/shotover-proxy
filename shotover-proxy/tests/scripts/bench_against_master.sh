@@ -15,13 +15,15 @@ fi
 echo -e "\nBenchmarking main as a baseline"
 git fetch origin
 git checkout origin/$GITHUB_BASE_REF
-cargo bench --bench redis_benches -- --save-baseline master --noplot
-cargo bench --bench chain_benches -- --save-baseline master --noplot
+cargo bench --all-features --bench redis_benches -- --save-baseline master --noplot
+cargo bench --all-features --bench chain_benches -- --save-baseline master --noplot
+cargo bench --all-features --bench cassandra_benches -- --save-baseline master --noplot
 
 echo -e "\nBenchmarking PR branch against main as a baseline"
 git checkout $ORIGINAL_REF
-cargo bench --bench redis_benches -- --baseline master --noplot | tee benches_log.txt -a
-cargo bench --bench chain_benches -- --baseline master --noplot | tee benches_log.txt -a
+cargo bench --all-features --bench redis_benches -- --baseline-lenient master --noplot | tee benches_log.txt -a
+cargo bench --all-features --bench chain_benches -- --baseline-lenient master --noplot | tee benches_log.txt -a
+cargo bench --all-features --bench cassandra_benches -- --baseline-lenient master --noplot | tee benches_log.txt -a
 
 # grep returns non zero exit code when it doesnt find anything so we need to disable pipefail
 set +o pipefail
@@ -36,8 +38,19 @@ if [[ "$COUNT_REGRESS" != "0" || "$COUNT_IMPROVE" != "0" ]]; then
 
   # grep returns non zero exit code when it doesnt find anything so we need to disable -e
   set +e
-  # Kind of brittle but -B5 includes the 5 lines prior which always happens to includes the bench name + results
-  grep -B5 "Performance has regressed." benches_log.txt >> comment_info/message.txt
-  grep -B5 "Performance has improved." benches_log.txt >> comment_info/message.txt
+
+  if [[ "$COUNT_REGRESS" != "0" ]]; then
+    echo "\`\`\`" >> comment_info/message.txt
+    # Kind of brittle but -B5 includes the 5 lines prior which always happens to includes the bench name + results
+    grep -B6 "Performance has regressed." benches_log.txt >> comment_info/message.txt
+    echo "\`\`\`" >> comment_info/message.txt
+  fi
+
+  if [[ "$COUNT_IMPROVE" != "0" ]]; then
+    echo "\`\`\`" >> comment_info/message.txt
+    grep -B6 "Performance has improved." benches_log.txt >> comment_info/message.txt
+    echo "\`\`\`" >> comment_info/message.txt
+  fi
+
   set -e
 fi

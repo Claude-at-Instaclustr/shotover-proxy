@@ -1,19 +1,9 @@
-use core::fmt;
-use std::fmt::{Debug, Formatter};
-use std::pin::Pin;
-
-use anyhow::Result;
-use async_recursion::async_recursion;
-use async_trait::async_trait;
-use futures::Future;
-use serde::Deserialize;
-
 use crate::config::topology::TopicHolder;
 use crate::error::ChainResponse;
-use crate::message::{Message, Messages};
+use crate::message::Messages;
+use crate::transforms::cassandra::peers_rewrite::CassandraPeersRewrite;
+use crate::transforms::cassandra::peers_rewrite::CassandraPeersRewriteConfig;
 use crate::transforms::cassandra::sink_single::{CassandraSinkSingle, CassandraSinkSingleConfig};
-use metrics::{counter, histogram};
-
 use crate::transforms::chain::TransformChain;
 use crate::transforms::coalesce::{Coalesce, CoalesceConfig};
 use crate::transforms::debug::printer::DebugPrinter;
@@ -23,12 +13,14 @@ use crate::transforms::distributed::consistent_scatter::{
     ConsistentScatter, ConsistentScatterConfig,
 };
 use crate::transforms::filter::{QueryTypeFilter, QueryTypeFilterConfig};
-use crate::transforms::kafka_sink::{KafkaSink, KafkaSinkConfig};
 use crate::transforms::load_balance::ConnectionBalanceAndPool;
+#[cfg(test)]
 use crate::transforms::loopback::Loopback;
 use crate::transforms::null::Null;
 use crate::transforms::parallel_map::{ParallelMap, ParallelMapConfig};
 use crate::transforms::protect::Protect;
+#[cfg(feature = "alpha-transforms")]
+use crate::transforms::protect::ProtectConfig;
 use crate::transforms::query_counter::{QueryCounter, QueryCounterConfig};
 use crate::transforms::redis::cache::{RedisConfig, SimpleRedisCache};
 use crate::transforms::redis::cluster_ports_rewrite::{
@@ -38,7 +30,16 @@ use crate::transforms::redis::sink_cluster::{RedisSinkCluster, RedisSinkClusterC
 use crate::transforms::redis::sink_single::{RedisSinkSingle, RedisSinkSingleConfig};
 use crate::transforms::redis::timestamp_tagging::RedisTimestampTagger;
 use crate::transforms::tee::{Tee, TeeConfig};
+use anyhow::Result;
+use async_recursion::async_recursion;
+use async_trait::async_trait;
+use core::fmt;
 use core::fmt::Display;
+use futures::Future;
+use metrics::{counter, histogram};
+use serde::Deserialize;
+use std::fmt::{Debug, Formatter};
+use std::pin::Pin;
 use strum_macros::IntoStaticStr;
 use tokio::time::Instant;
 
@@ -48,7 +49,6 @@ pub mod coalesce;
 pub mod debug;
 pub mod distributed;
 pub mod filter;
-pub mod kafka_sink;
 pub mod load_balance;
 pub mod loopback;
 pub mod noop;
@@ -70,10 +70,11 @@ pub mod util;
 pub enum Transforms {
     CassandraSinkSingle(CassandraSinkSingle),
     RedisSinkSingle(RedisSinkSingle),
-    KafkaSink(KafkaSink),
+    CassandraPeersRewrite(CassandraPeersRewrite),
     RedisCache(SimpleRedisCache),
     Tee(Tee),
     Null(Null),
+    #[cfg(test)]
     Loopback(Loopback),
     Protect(Protect),
     ConsistentScatter(ConsistentScatter),
@@ -100,11 +101,12 @@ impl Transforms {
     async fn transform<'a>(&'a mut self, message_wrapper: Wrapper<'a>) -> ChainResponse {
         match self {
             Transforms::CassandraSinkSingle(c) => c.transform(message_wrapper).await,
-            Transforms::KafkaSink(k) => k.transform(message_wrapper).await,
+            Transforms::CassandraPeersRewrite(c) => c.transform(message_wrapper).await,
             Transforms::RedisCache(r) => r.transform(message_wrapper).await,
             Transforms::Tee(m) => m.transform(message_wrapper).await,
             Transforms::DebugPrinter(p) => p.transform(message_wrapper).await,
             Transforms::Null(n) => n.transform(message_wrapper).await,
+            #[cfg(test)]
             Transforms::Loopback(n) => n.transform(message_wrapper).await,
             Transforms::Protect(p) => p.transform(message_wrapper).await,
             Transforms::DebugReturner(p) => p.transform(message_wrapper).await,
@@ -129,12 +131,13 @@ impl Transforms {
     async fn _prep_transform_chain(&mut self, t: &mut TransformChain) -> Result<()> {
         match self {
             Transforms::CassandraSinkSingle(a) => a.prep_transform_chain(t).await,
+            Transforms::CassandraPeersRewrite(c) => c.prep_transform_chain(t).await,
             Transforms::RedisSinkSingle(a) => a.prep_transform_chain(t).await,
-            Transforms::KafkaSink(a) => a.prep_transform_chain(t).await,
             Transforms::RedisCache(a) => a.prep_transform_chain(t).await,
             Transforms::Tee(a) => a.prep_transform_chain(t).await,
             Transforms::DebugPrinter(a) => a.prep_transform_chain(t).await,
             Transforms::Null(a) => a.prep_transform_chain(t).await,
+            #[cfg(test)]
             Transforms::Loopback(a) => a.prep_transform_chain(t).await,
             Transforms::Protect(a) => a.prep_transform_chain(t).await,
             Transforms::ConsistentScatter(a) => a.prep_transform_chain(t).await,
@@ -154,7 +157,7 @@ impl Transforms {
     fn validate(&self) -> Vec<String> {
         match self {
             Transforms::CassandraSinkSingle(c) => c.validate(),
-            Transforms::KafkaSink(k) => k.validate(),
+            Transforms::CassandraPeersRewrite(c) => c.validate(),
             Transforms::RedisCache(r) => r.validate(),
             Transforms::Tee(t) => t.validate(),
             Transforms::RedisSinkSingle(r) => r.validate(),
@@ -169,6 +172,7 @@ impl Transforms {
             Transforms::Coalesce(s) => s.validate(),
             Transforms::QueryTypeFilter(s) => s.validate(),
             Transforms::QueryCounter(s) => s.validate(),
+            #[cfg(test)]
             Transforms::Loopback(l) => l.validate(),
             Transforms::Protect(p) => p.validate(),
             Transforms::DebugReturner(d) => d.validate(),
@@ -179,7 +183,7 @@ impl Transforms {
     fn is_terminating(&self) -> bool {
         match self {
             Transforms::CassandraSinkSingle(c) => c.is_terminating(),
-            Transforms::KafkaSink(k) => k.is_terminating(),
+            Transforms::CassandraPeersRewrite(c) => c.is_terminating(),
             Transforms::RedisCache(r) => r.is_terminating(),
             Transforms::Tee(t) => t.is_terminating(),
             Transforms::RedisSinkSingle(r) => r.is_terminating(),
@@ -194,6 +198,7 @@ impl Transforms {
             Transforms::Coalesce(s) => s.is_terminating(),
             Transforms::QueryTypeFilter(s) => s.is_terminating(),
             Transforms::QueryCounter(s) => s.is_terminating(),
+            #[cfg(test)]
             Transforms::Loopback(l) => l.is_terminating(),
             Transforms::Protect(p) => p.is_terminating(),
             Transforms::DebugReturner(d) => d.is_terminating(),
@@ -208,7 +213,7 @@ impl Transforms {
 pub enum TransformsConfig {
     CassandraSinkSingle(CassandraSinkSingleConfig),
     RedisSinkSingle(RedisSinkSingleConfig),
-    KafkaSink(KafkaSinkConfig),
+    CassandraPeersRewrite(CassandraPeersRewriteConfig),
     RedisCache(RedisConfig),
     Tee(TeeConfig),
     ConsistentScatter(ConsistentScatterConfig),
@@ -218,7 +223,10 @@ pub enum TransformsConfig {
     DebugPrinter,
     DebugReturner(DebugReturnerConfig),
     Null,
+    #[cfg(test)]
     Loopback,
+    #[cfg(feature = "alpha-transforms")]
+    Protect(ProtectConfig),
     ParallelMap(ParallelMapConfig),
     //PoolConnections(ConnectionBalanceAndPoolConfig),
     Coalesce(CoalesceConfig),
@@ -236,7 +244,7 @@ impl TransformsConfig {
     ) -> Result<Transforms> {
         match self {
             TransformsConfig::CassandraSinkSingle(c) => c.get_source(chain_name).await,
-            TransformsConfig::KafkaSink(k) => k.get_source().await,
+            TransformsConfig::CassandraPeersRewrite(c) => c.get_source(topics).await,
             TransformsConfig::RedisCache(r) => r.get_source(topics).await,
             TransformsConfig::Tee(t) => t.get_source(topics).await,
             TransformsConfig::RedisSinkSingle(r) => r.get_source(chain_name).await,
@@ -248,7 +256,10 @@ impl TransformsConfig {
             TransformsConfig::DebugPrinter => Ok(Transforms::DebugPrinter(DebugPrinter::new())),
             TransformsConfig::DebugReturner(d) => d.get_source().await,
             TransformsConfig::Null => Ok(Transforms::Null(Null::default())),
+            #[cfg(test)]
             TransformsConfig::Loopback => Ok(Transforms::Loopback(Loopback::default())),
+            #[cfg(feature = "alpha-transforms")]
+            TransformsConfig::Protect(p) => p.get_source().await,
             TransformsConfig::RedisSinkCluster(r) => r.get_source(chain_name).await,
             TransformsConfig::ParallelMap(s) => s.get_source(topics).await,
             //TransformsConfig::PoolConnections(s) => s.get_source(topics).await,
@@ -451,7 +462,7 @@ pub trait Transform: Send {
     /// * Transforms that don't call subsequent chains via `message_wrapper.call_next_transform()` are called terminating transforms.
     /// * Transforms that do call subsquent chains via `message_wrapper.call_next_transform()` are non-terminating transforms.
     ///
-    /// You can have have a transforms that is both non-terminating and a sink (see [`crate::transforms::kafka_sink::KafkaSink`]).
+    /// You can have have a transforms that is both non-terminating and a sink.
     ///
     /// A basic transform that logs query data and counts the number requests it sees could be defined like so:
     /// ```
@@ -510,5 +521,4 @@ pub trait Transform: Send {
     }
 }
 
-pub type ResponseFuture =
-    Pin<Box<dyn Future<Output = Result<(Message, Result<Messages>)>> + std::marker::Send>>;
+pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<util::Response>> + std::marker::Send>>;

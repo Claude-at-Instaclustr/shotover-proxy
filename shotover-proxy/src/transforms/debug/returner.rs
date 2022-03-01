@@ -1,11 +1,8 @@
-use crate::error::ChainResponse;
-use crate::message::{Message, MessageDetails, Messages};
-use crate::protocols::RawFrame;
-use crate::transforms::Transforms;
-use crate::transforms::{Transform, Wrapper};
+use crate::frame::{Frame, RedisFrame};
+use crate::message::{Message, Messages};
+use crate::transforms::{ChainResponse, Transform, Transforms, Wrapper};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use redis_protocol::resp2::prelude::Frame;
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone)]
@@ -49,10 +46,10 @@ impl Transform for DebugReturner {
             Response::Redis(string) => Ok(message_wrapper
                 .messages
                 .iter()
-                .map(|_| Message {
-                    details: MessageDetails::Unknown,
-                    modified: false,
-                    original: RawFrame::Redis(Frame::BulkString(string.clone().into_bytes())),
+                .map(|_| {
+                    Message::from_frame(Frame::Redis(RedisFrame::BulkString(
+                        string.to_string().into(),
+                    )))
                 })
                 .collect()),
             Response::Fail => Err(anyhow!("Intentional Fail")),

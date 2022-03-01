@@ -4,8 +4,9 @@ use crate::transforms::{Transforms, Wrapper};
 use anyhow::{anyhow, Result};
 use futures::TryFutureExt;
 
+use derivative::Derivative;
 use itertools::Itertools;
-use metrics::{counter, histogram, register_counter, register_histogram, Unit};
+use metrics::{histogram, register_counter, register_histogram, Counter};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Receiver as OneReceiver;
 use tokio::time::Duration;
@@ -22,10 +23,16 @@ type InnerChain = Vec<Transforms>;
 /// Transform chains are defined by the user in Shotover's configuration file and are linked to sources.
 ///
 /// The transform chain is a vector of mutable references to the enum [Transforms] (which is an enum dispatch wrapper around the various transform types).
-#[derive(Debug, Clone)]
+#[derive(Clone, Derivative)]
+#[derivative(Debug)]
 pub struct TransformChain {
     pub name: String,
     pub chain: InnerChain,
+
+    #[derivative(Debug = "ignore")]
+    chain_total: Counter,
+    #[derivative(Debug = "ignore")]
+    chain_failures: Counter,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +44,7 @@ pub struct BufferedChain {
 }
 
 impl BufferedChain {
+    #[must_use]
     pub fn to_new_instance(&self, buffer_size: usize) -> Self {
         self.original_chain.clone().into_buffered_chain(buffer_size)
     }
@@ -181,27 +189,22 @@ impl TransformChain {
         }
     }
 
-    pub fn new_no_shared_state(transform_list: Vec<Transforms>, name: String) -> Self {
-        TransformChain {
-            name,
-            chain: transform_list,
-        }
-    }
-
     pub fn new(transform_list: Vec<Transforms>, name: String) -> Self {
-        register_counter!("shotover_chain_total", Unit::Count, "chain" => name.clone());
-        register_counter!("shotover_chain_failures", Unit::Count, "chain" => name.clone());
-        register_histogram!("shotover_chain_latency", Unit::Seconds, "chain" => name.clone());
-
         for transform in &transform_list {
-            register_counter!("shotover_transform_total", Unit::Count, "transform" => transform.get_name());
-            register_counter!("shotover_transform_failures", Unit::Count, "transform" => transform.get_name());
-            register_histogram!("shotover_transform_latency", Unit::Seconds, "transform" => transform.get_name());
+            register_counter!("shotover_transform_total", "transform" => transform.get_name());
+            register_counter!("shotover_transform_failures", "transform" => transform.get_name());
+            register_histogram!("shotover_transform_latency", "transform" => transform.get_name());
         }
+
+        let chain_total = register_counter!("shotover_chain_total", "chain" => name.clone());
+        let chain_failures = register_counter!("shotover_chain_failures", "chain" => name.clone());
+        register_histogram!("shotover_chain_latency", "chain" => name.clone());
 
         TransformChain {
             name,
             chain: transform_list,
+            chain_total,
+            chain_failures,
         }
     }
 
@@ -234,7 +237,7 @@ impl TransformChain {
                     ));
                 }
 
-                errors.extend(transform.validate().iter().map(|x| format!("  {}", x)));
+                errors.extend(transform.validate().iter().map(|x| format!("  {x}")));
 
                 errors
             })
@@ -261,10 +264,11 @@ impl TransformChain {
         wrapper.reset(iter);
 
         let result = wrapper.call_next_transform().await;
-        counter!("shotover_chain_total", 1, "chain" => self.name.clone());
+        self.chain_total.increment(1);
         if result.is_err() {
-            counter!("shotover_chain_failures", 1, "chain" => self.name.clone())
+            self.chain_failures.increment(1);
         }
+
         histogram!("shotover_chain_latency", start.elapsed(),  "chain" => self.name.clone(), "client_details" => client_details);
         result
     }
@@ -279,7 +283,7 @@ mod chain_tests {
 
     #[tokio::test]
     async fn test_validate_invalid_chain() {
-        let chain = TransformChain::new_no_shared_state(vec![], "test-chain".to_string());
+        let chain = TransformChain::new(vec![], "test-chain".to_string());
         assert_eq!(
             chain.validate(),
             vec!["test-chain:", "  Chain cannot be empty"]
@@ -288,7 +292,7 @@ mod chain_tests {
 
     #[tokio::test]
     async fn test_validate_valid_chain() {
-        let chain = TransformChain::new_no_shared_state(
+        let chain = TransformChain::new(
             vec![
                 Transforms::DebugPrinter(DebugPrinter::new()),
                 Transforms::DebugPrinter(DebugPrinter::new()),

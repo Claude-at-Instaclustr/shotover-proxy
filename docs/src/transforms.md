@@ -27,12 +27,11 @@ Future transforms won't be added to the public API while in alpha. But in these 
 | Transform                                             | Terminating | Implementation Status |
 |-------------------------------------------------------|-------------|-----------------------|
 | [CassandraSinkSingle](#cassandrasinksingle)           | ✅          | Alpha                 |
+| [CassandraPeersRewrite](#cassandrapeersrewrite)       | ❌          | Alpha                 |
 | [Coalesce](#coalesce)                                 | ❌          | Alpha                 |
 | [ConsistentScatter](#consistentscatter)               | ✅          | Alpha                 |
 | [DebugPrinter](#debugprinter)                         | ❌          | Alpha                 |
 | [DebugReturner](#debugreturner)                       | ✅          | Alpha                 |
-| [KafkaSink](#kafkasink)                               | ✅          | Alpha                 |
-| [Loopback](#loopback)                                 | ✅          | Beta                  |
 | [Null](#null)                                         | ✅          | Beta                  |
 | [ParallelMap](#parallelmap)                           | ✅          | Alpha                 |
 | [Protect](#protect)                                   | ❌          | Alpha                 |
@@ -54,12 +53,21 @@ This transform will take a query, serialise it into a CQL4 compatible format and
 - CassandraSinkSingle:
     # The IP address and port of the upstream cassandra node/service.
     remote_address: "127.0.0.1:9042"
-    # When true creates an AST for the query.
-    # When false the AST is not created, this saves CPU for straight passthrough cases (no processing on the query).
-    result_processing: true
 ```
 
 Note: this will just pass the query to the remote node. No cluster discovery or routing occurs with this transform.
+
+
+### CassandraPeersRewrite
+
+This transform should be used with the `CassandraSinkSingle` transform. It will write over the ports of the peers returned by queries to the `system.peers_v2` table in Cassandra with a user supplied value (typically the port that Shotover is listening on so Cassandra drivers will connect to Shotover instead of the Cassandra nodes themselves).
+
+
+```yaml
+- CassandraPeersRewrite:
+    # rewrite the peer ports to 9043
+    port: 9043
+```
 
 ### Coalesce
 
@@ -140,14 +148,6 @@ Delay the transform chain at the position that this transform sits at.
 ```
 -->
 
-### Loopback
-
-This transform will drop any messages it receives and return the same message back as a response.
-
-```yaml
-- Loopback
-```
-
 ### Null
 
 This transform will drop any messages it receives and return an empty response.
@@ -180,21 +180,6 @@ If we have a parallelism of 3 then we would have 3 instances of the chain: C1, C
           name: "DR chain"
       - RedisSinkSingle:
           remote_address: "127.0.0.1:6379"
-```
-
-### KafkaSink
-
-This transform will take a query and push it to a given Kafka topic.
-
-```yaml
-- KafkaSink:
-    # A map of configuration options for the Kafka driver. Supports all flags as supported by the librdkafka driver.
-    # See https://docs.confluent.io/5.5.0/clients/librdkafka/md_CONFIGURATION.html for details.
-    config_values:
-      bootstrap.servers: "127.0.0.1:9092"
-      message.timeout.ms: "5000"
-    # The name of the kafka topic
-    topic: "my_kafka_topic"
 ```
 
 ### Protect
