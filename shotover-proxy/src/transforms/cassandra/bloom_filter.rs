@@ -1,3 +1,4 @@
+use reduce::Reduce;
 use std::io::Cursor;
 use murmur3::murmur3_x64_128;
 use crate::concurrency::FuturesOrdered;
@@ -9,10 +10,10 @@ use crate::protocols::RawFrame;
 use crate::transforms::util::unordered_cluster_connection_pool::OwnedUnorderedConnectionPool;
 use crate::transforms::util::Request;
 use crate::transforms::{Transform, Transforms, Wrapper};
-use bloomfilter::bloomfilter::{Shape, Simple, BloomFilterType, BloomFilter};
+use bloomfilter::bloomfilter::{Shape, Simple, BloomFilter};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use cassandra_protocol::frame::{Frame, StreamId};
+use cassandra_protocol::frame::{Frame, StreamId, Version};
 use metrics::{counter, register_counter, Unit};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -20,6 +21,7 @@ use std::string::FromUtf8Error;
 use std::time::Duration;
 use bloomfilter::bloomfilter::hasher::{Hasher, HasherType, SimpleHasher};
 use bytes::Buf;
+use cassandra_protocol::frame::frame_error::{AdditionalErrorInfo, ErrorBody};
 use cassandra_protocol::frame::frame_result::ColType::Udt;
 use cassandra_protocol::query::QueryParams;
 use tokio::io::AsyncReadExt;
@@ -31,6 +33,8 @@ use crate::codec::cassandra::CassandraCodec;
 use crate::frame::{CassandraFrame, CassandraOperation, CQL};
 use tree_sitter::{Language, Tree, TreeCursor, Node, Query, QueryCursor, QueryCapture, QueryMatch, LogType};
 use tree_sitter_cql::Parser;
+use proc_macro::TokenTree;
+use crate::frame::CassandraOperation::Error;
 use crate::transforms::cassandra::bloom_filter::CassandraASTStatementType::{AlterKeyspace, AlterMaterializedView, AlterRole, AlterTable, AlterType, AlterUser, ApplyBatch, CreateAggregate, CreateFunction, CreateIndex, CreateKeyspace, CreateMaterializedView, CreateRole, CreateTable, CreateTrigger, CreateType, CreateUser, DeleteStatement, DropAggregate, DropFunction, DropIndex, DropKeyspace, DropMaterializedView, DropRole, DropTable, DropTrigger, DropType, DropUser, Grant, InsertStatement, ListPermissions, ListRoles, Revoke, SelectStatement, Truncate, Update, UseStatement};
 
 /// The configuration for a single bloom filter in a single table.
@@ -112,83 +116,234 @@ impl CassandraBloomFilter {
 
     /// process the query message.  This method has to handle all possible Queries that could
     /// impact the Bloom filter.
-    fn process_query(&self, frame : &CassandraFrame, query: String, params: QueryParams ) -> msg {
-        let language = tree_sitter_cql::language();
-        let mut parser = tree_sitter_cql::Parser::new();
-        if parser.set_language(language).is_err() {
-            panic!("language version mismatch");
-        }
-
-        //parser.set_logger( Some( Box::new( log)) );
-        let source_code = query.as_bytes();
-        let tree = parser.parse(source_code, None).unwrap();
-        println!("{}", tree.root_node().to_sexp());
-
-        match CassandraAST::get_statement_type( tree ) {
-            SelectStatement => process_select(tree),
-            InsertStatement => process_insert(tree),
-            DeleteStatement => process_delete(tree),
-            UseStatement => process_use(tree),
+    fn process_query(&self, ast : &mut CassandraAST, msg : &mut Message ) -> Message {
+        match ast.statement_type {
+            SelectStatement => self.process_select(ast, msg),
+            InsertStatement => self.process_insert(ast, msg),
+            DeleteStatement => self.process_delete(ast, msg),
+            UseStatement => { self.process_use(ast); msg},
             _ => msg,
         }
     }
 
-    fn  process_insert( tree : Tree ) {
-        let nodes: Box<Vec<Node>> = CassandraAST::search( tree.root_node(), "insert_column_spec / column_list" );
+    fn process_insert( &self, ast : & CassandraAST, msg : &mut Message ) -> Message {
+        let table_name = ast.get_table_name();
+        let cfg = self.tables.get( table_name.as_str() );
+        match cfg {
+            None => msg,
+            Some(config) => {
+                // we need to determine if the bloom filter is being updated if any of the
+                // affected nodes are also updated.
+                // this is not quite accurate as we do not deal with simultaneous updates
+                let nodes: Box<Vec<Node>> = ast.search( "insert_column_spec / column_list / column" );
+                let columns : Vec<String> = nodes.iter().map( |n| ast.node_text(n) ).collect();
+                let some_columns : bool = columns.map( |c| config.columns.contains( c )).reduce( |a,b|  a || b);
+                let all_columns : bool = columns.map( |c| config.columns.contains( c )).reduce( |a,b|  a && b);
+                let has_filter = columns.contains( &config.bloomColumn );
+                // cases to check
+                // none of the columns -> ok
+                // has filter -> ok
+                // some but not all columns  -> error
+                // all columns and not bloom filter -> add bloom filter
+                // all columns and bloom filter -> ok
+                if !some_columns || has_filter {
+                    return msg;
+                }
 
-    }
-
-    fn process_delete( tree : Tree ) {
-
-    }
-
-    fn process_use( tree : Tree ) {
-
-    }
-
-    fn process_select( tree : Tree ) {
-        query.to_query_string()
-        let x = frame.operation;
-        msg.namespace()
-        let fq_table_name = msg.namespace.join( ".");
-        let config = self.tables.get( fq_table_name )?;
-        let shape = Shape {
-            m : config.bits,
-            k : config.funcs,
-        };
-        let query_values = msg.query_values?;
-        let mut bloomfilter = Simple::empty_instance(self.get_shape( fq_table_name ))
-        let mut columns: Vec<String> = vec![];
-        // modify these to remove ones from bloom filter
-        let mut values =  msg.query_values?.clone();
-        let mut rqd_projection = msg.projection?.clone();
-        for column_name in config.columns {
-            match query_values.get( column_name.as_str() ) {
-                Some(value) => {
-                    if ! rqd_projection.contains( &column_name ) {
-                        rqd_projectionj.insert(column_name.clone());
-                    }
-                    values.remove( column_name.as_str() );
-                    bloomfilter.merge_hasher_in_place( self.make_hasher(value));
-                },
-                _ => {},
+                // some but not all and no filter
+                if !all_columns {
+                    let mut frame  = msg.frame().unwrap().clone().into_cassandra()?;
+                    frame.operation = Error(ErrorBody {
+                        error_code: 0x2200,
+                        message: "modifying some but not all bloom filter columns requires updating filter".to_string(),
+                        additional_info: AdditionalErrorInfo::Invalid,
+                    });
+                    frame.map( Frame::Cassandra)
+                    let mut new_msg = Message::from_frame( Frame::Cassandra(frame) );
+                    new_msg.meta_timestamp = msg.meta_timestamp;
+                    new_msg.return_to_sender = true;
+                    return new_msg;
+                }
+                // all columns and not bloom filter -> add bloom filter
+                // TODO add bloom filter column and value to the AST and create a new Message that contains the query
             }
         }
+    }
 
-        // bloom filter now contains all the columns from the query.
-        // oldValues contains the column-value pairs that went into the bloom filter
-        // values contains only the values that were moved to the query.
-        values.insert( config.bloomColumn.clone(), self.make_filter_column( bloomfilter ));
+    fn process_delete( ast : & CassandraAST, msg : Message ) -> Message {
+        let table_name = ast.get_table_name();
+        let cfg = self.tables.get( table_name.as_str() );
+        match cfg {
+            None => msg,
+            Some(config) => {
+                // we need to determine if bloom filter columns are being deleted and the
+                // bloom filter not updated
+                let nodes: Box<Vec<Node>> = ast.search( "delete_column_list / column" );
+                let columns : Vec<String> = nodes.iter().map( |n| ast.node_text(n) ).collect();
+                let some_columns : bool = columns.map( |c| config.columns.contains( c )).reduce( |a,b|  a || b);
+                let all_columns : bool = columns.map( |c| config.columns.contains( c )).reduce( |a,b|  a && b);
+                let has_filter = columns.contains( &config.bloomColumn );
+                // cases to check
+                // none of the columns -> ok
+                // some of the columns and bloom filter -> ok
+                // otherwise error
+                if !some_columns || has_filter {
+                    return msg;
+                }
 
-        QueryMessage{
-            query_string: "".to_string(),
-            namespace: msg.namespace.clone(),
-            primary_key: msg.primary_key.clone(),
-            query_values: Some(values),
-            projection: Some(rqd_projection),
-            query_type: msg.query_type.clone(),
-            ast: None
+                let mut frame  = msg.frame().unwrap().clone().into_cassandra()?;
+                frame.operation = Error(ErrorBody {
+                    error_code: 0x2200,
+                    message: "deleting bloom filter columns requires deleting filter".to_string(),
+                    additional_info: AdditionalErrorInfo::Invalid,
+                });
+                frame.map( Frame::Cassandra)
+                let mut new_msg = Message::from_frame( Frame::Cassandra(frame) );
+                new_msg.meta_timestamp = msg.meta_timestamp;
+                new_msg.return_to_sender = true;
+                return new_msg;
+            }
         }
+    }
+
+    fn process_use( &self, ast : & mut CassandraAST ) {
+        // structure should be (source_file (use))
+        ast.default_keyspace = Some(ast.node_text( ast.tree.root_node().child(0).child(1)));
+    }
+
+    fn process_select( &self, ast : CassandraAST, msg :Message ) -> Message {
+        let table_name = ast.get_table_name();
+        let cfg = self.tables.get( table_name.as_str() );
+        match cfg {
+            None => msg,
+            Some(config) => {
+                // we need to
+                // remove any where clauses that have the bloom filter columns
+                // build a bloom filter with the values
+                // insert the bloom filter where clause into the query
+                // add the where clause bloom filter columns to the select so we can filter later
+                let shape = Shape {
+                    m: config.bits,
+                    k: config.funcs,
+                };
+
+                let nodes: Box<Vec<Node>> = ast.search( "where_spec / relation_elements / column" );
+                let columns : Vec<String> = nodes.iter().map( |n| ast.node_text(n) ).collect();
+                let some_columns : bool = columns.map( |c| config.columns.contains( c )).reduce( |a,b|  a || b);
+                let has_filter = columns.contains( &config.bloomColumn );
+                // there is a weird case where the bloom filter is provided along with the search values
+                // we will assume that the user knows what they want and not touch the filter but will
+                // remove the columns from the query so the query will execute.  We will add the columns
+                if some_columns {
+                    let moved_columns : Vec<String> = columns.iter()
+                        .filter(|c| config.columns.contains( c ))
+                        .collect();
+                    let moved_column_ids : Vec<usize> = nodes.iter().map( |n| n.id() ).collect();
+                    /*
+                    relations come in several flavors:
+                        column comparator constant
+                        function comparator constant
+                        function comparator function
+                        column IN ( function_args )
+                        (column ...) IN ( tuple...)
+                        (column ...) comparator tuple...
+                        column CONTAINS constant
+                        column CONTAINS KEY constant
+
+                    a tuple is defined as
+                        tuple => ( constant, (constant | tuple )...)
+                            or  (constant (tuple ...))
+                    we are only interested in the ones that have columns
+                     */
+
+                    let relations: Box<Vec<Node>> = ast.search( "where_spec / relation_elements[column]" );
+                    let modified_relations = self.modify_relations( ast, relations, moved_column_ids, has_filter);
+// END OF EDIT
+                }
+
+            }
+        }
+    }
+
+    ///
+    /// Modify the relations.
+    ///
+    ///  relations come in several flavors:
+    ///                         column comparator constant
+    ///                         function comparator constant
+    ///                         function comparator function
+    ///                         column IN ( function_args )
+    ///                         (column ...) IN ( tuple...)
+    ///                         (column ...) comparator tuple...
+    ///                         column CONTAINS constant
+    ///                         column CONTAINS KEY constant
+    ///
+    ///                     a tuple is defined as
+    ///                         tuple => ( constant, (constant | tuple )...)
+    ///                             or  (constant (tuple ...))
+    ///                     a comparator is defined as one of
+    ///                             "<", "<=", "<>", "=", ">", ">="
+    ///
+    /// The relations vector only has the ones that have columns
+    ///  if there is a bloom filter column provided then we just remove columns.
+    ///  if there is not a bloom filter provided then we can only accept equality comparisons
+    fn modify_relations( &self, ast : CassandraAST, relations: Box<Vec<Node>>, moved_columns : Vec<usize>, has_filter : bool ) -> Vec<Result<String,String>> {
+        let mut result : Vec<Result<String,String>> = Vec::with_capacity( relations.len() );
+        for relation in relations {
+            if (! has_filter) &&
+                CassandraAST::hasNode( relation, "<|<=|<>|>|>=|IN|CONTAINS") {
+                result.push( Err("only equality checks are allowed if bloom filter is not provided".to_string()))
+            } else {
+                // we now have
+                // column = constant
+                // (column ...) = tuple
+                if relation.child(0).unwrap().eq("(") {
+                    let mut resultStr = String::new();
+                    // we have a tuple (column ...) = tuple
+                    let mut child_number:usize = 0;
+                    let mut separator = '(';
+                    while child_number < relation.child_count() {
+                        let child :Option<Node> = relation.child(child_number+1);
+                        match child {
+                            None => if separator == ',' {
+                                resultStr.push(')');
+                            },
+                            // FIXME this is wrong.  We need to track colums that are removed
+                            // and remove the constants that match
+                            Some(node) => {
+                                if moved_columns.contains(node.id()) {
+                                    // do nothing
+                                } else if node.kind().eq("=") {
+                                    resultStr.push_str( ") = ");
+                                    separator = '(';
+                                } else if node.kind().eq("constant") || node.kind().eq("column") {
+                                    resultStr.push( separator );
+                                    resultStr.push_str(ast.node_text(node).as_str());
+                                    separator = ',';
+                                } else if node.kind().eq( "assignment_tuple") {
+                                    result.push( Err("Assignment tuples not supported in equality checks".to_string()))
+                                    resultStr = String::new();
+                                    break;
+                                }
+                            },
+                        }
+                        child_number += 2;
+                    }
+                    if ! resultStr.is_empty() {
+                        result.push( resultStr );
+                    }
+
+                } else {
+                    result.push(Ok("".to_string()))
+                }
+            }
+        }
+        result
+    }
+
+    fn node_filter_print( &self,ast : CassandraAST, node : &node, moved_columns : Vec<String> ) {
+        moved_columns
+        if (node.kind() == )
     }
 
     fn remove_unwanted_data( row_data : &mut Vec<HashMap<String,Value>>, &old_msg : &QueryMessage) {
@@ -235,8 +390,8 @@ impl CassandraBloomFilter {
             match frame.operation {
                 CassandraOperation::QueryType{ query, params } => {
                     self.messages.insert(streamId, msg.clone());
-
-                    new_msgs.push(self.process_query(&frame, query.to_query_string(), params);
+                    let ast = CassandraAST::new(query.to_query_string());
+                    new_msgs.push(self.process_query( ast, msg );
                 },
                 CassandraOperation::Result(result) => {
                     self.process_result(& result, &stream);
@@ -345,37 +500,129 @@ impl CassandraBloomFilter {
 
 }
 
+pub struct CassandraAST {
+    text: [u8],
+    tree: Tree,
+    statement_type: CassandraASTStatementType,
+    default_keyspace: Option<String>,
+
+}
+
 impl CassandraAST {
 
+    /// create an AST from the query string
+    pub fn new(cassandra_statement : String) ->CassandraAST {
+        let language = tree_sitter_cql::language();
+        let mut parser = tree_sitter_cql::Parser::new();
+        if parser.set_language(language).is_err() {
+            panic!("language version mismatch");
+        }
+
+        // this code enables debug logging
+        /*
+        fn log( _x : LogType, message : &str) {
+            println!("{}", message );
+        }
+        parser.set_logger( Some( Box::new( log)) );
+        */
+        let tree = parser.parse(source_code, None).unwrap(),
+
+        CassandraAST {
+            text : *cassandra_statement.as_bytes(),
+            tree,
+            statement_type: if tree.root_node().has_error() {
+                    CassandraASTStatementType::UNKNOWN(cassandra_statement)
+                } else {
+                    CassandraASTStatementType::from_node(tree.root_node())
+                },
+            default_keyspace: None,
+        }
+    }
+
+    /// returns true if the parsing exposed an error in the query
+    pub fn has_error(&self) -> bool {
+        self.tree.root_node().has_error()
+    }
+
+    /// retrieves the query value for the node (word or phrase enclosed by the node)
+    pub fn node_text(&self, node : Node) -> String {
+        node.utf8_text(&self.text)
+    }
+
+    pub fn get_table_name(&self) -> String {
+        let nodes = self.search( "tree_name");
+        match nodes.first() {
+            None => "".to_string(),
+            Some(node) => {
+                let candidate_name = self.node_text( node );
+                if candidate_name.contains(".") {
+                    candidate_name.as_string()
+                } else {
+                    match self.default_keyspace {
+                        None => candidate_name,
+                        Some(keyspace) => format!("{}.{}", keyspace, candidate_name)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn search(&self, path : &'static str) -> Box<Vec<Node>> {
+        CassandraAST::searchNode(self.tree.root_node(), str)
+    }
+
     // TODO move this to tree-sitter-cql or other external location.
-    pub fn search<'tree>(node : Node<'tree>, path : &'static str) -> Box<Vec<Node<'tree>>> {
-        let mut nodes = Box::new(vec!(node));
-        for segment in path.split( '/').map(|tok| tok.trim() ) {
-            let mut newNodes  = Box::new(vec!());
+    pub fn searchNode<'tree>(node : Node<'tree>, path : &'static str) -> Box<Vec<Node<'tree>>> {
+        let mut nodes = Box::new(vec![node]);
+        for segment in path.split('/').map(|tok| tok.trim()) {
+            let mut newNodes = Box::new(vec![]);
+            let pattern = Pattern::from_str( segment );
             for node in nodes.iter() {
-                _find(&mut newNodes, *node, segment);
+                CassandraAST::_find(&mut newNodes, *node, &pattern );
             }
             nodes = newNodes;
         }
         nodes
     }
 
-    // TODO move this to tree-sitter-cql or other external location.
-    fn _find<'tree>(nodes : &mut Vec<Node<'tree>>, node : Node<'tree>, name : &str) {
-        if node.kind().eq(name) {
-            nodes.push( node );
+    // performs a recursive search in the tree
+    fn _find<'tree>(nodes: &mut Vec<Node<'tree>>, node: Node<'tree>, pattern: &SearchPattern) {
+        if pattern.name.is_match(node.kind()) {
+            match &pattern.child {
+                None => nodes.push(node),
+                Some( child ) => if CassandraAST::_has( &node, child ) {
+                    nodes.push(node);
+                }
+            }
         } else {
             if node.child_count() > 0 {
                 for childNo in 0..node.child_count() {
-                    _find( nodes, node.child( childNo ).unwrap(), name );
+                    CassandraAST::_find(nodes, node.child(childNo).unwrap(), pattern);
                 }
             }
         }
     }
 
-    // TODO move this to tree-sitter-cql or other external location.
-    fn has(node : Node, path : &'static str) -> bool {
-        return ! search( node, path ).is_empty()
+    /// checks if a node has a specific chld node
+    fn _has(node : &Node, name : &Regex) -> bool {
+        if node.child_count() > 0 {
+            for child_no in 0..node.child_count() {
+                let child: Node = node.child(child_no).unwrap();
+                let x = child.kind().eq(name);
+                if name.is_match(child.kind()) || CassandraAST::_has(&child, name) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn has(&self, path : &'static str) -> bool {
+        return ! self.search( node, path ).is_empty()
+    }
+
+    pub fn hasNode(node : Node, path : &'static str) -> bool {
+        return ! CassandraAST::searchNode( node, path ).is_empty()
     }
 
     pub fn get_statement_type( tree : Tree ) -> CassandraASTStatementType {
@@ -384,6 +631,27 @@ impl CassandraAST {
             node = node.child( 0 ).unwrap();
         }
         CassandraASTStatementType::from_node( node );
+    }
+}
+pub struct SearchPattern {
+    pub name : Regex,
+    pub child : Option<Regex>,
+}
+
+impl SearchPattern {
+    pub fn from_str( pattern : &str ) -> SearchPattern {
+        let parts : Vec<&str> = pattern.split("[").collect();
+        let namePat = format!("^{}$", parts[0].trim() );
+        Pattern {
+            name : Regex::new(  namePat.as_str() ).unwrap(),
+            child : if parts.len()==2 {
+                let name : Vec<&str> = parts[1].split("]").collect();
+                let namePat = format!("^{}$", name[0].trim() );
+                Some(Regex::new(namePat.as_str()).unwrap())
+            } else {
+                None
+            },
+        }
     }
 }
 
