@@ -33,12 +33,14 @@ pin-project-lite = "0.2"
 tokio-openssl = "0.6.2"
 openssl = { version = "0.10.36", features = ["vendored"] }
 async-recursion = "1.0"
+reduce = "0.1.4"
 
 # Error handling
 thiserror = "1.0"
 anyhow = "1.0.31"
 
 # Parsers
+tree-sitter = "0.20.5"
 tree-sitter-cql = { git = "https://github.com/Claude-at-Instaclustr/tree-sitter-cql", brach="main" }
 sqlparser = "0.14"
 serde = { version = "1.0.111", features = ["derive"] }

@@ -2109,6 +2109,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "reduce"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16d2dc47b68ac15ea328cd7ebe01d7d512ed29787f7d534ad2a3c341328b35d7"
+
+[[package]]
 name = "regex"
 version = "1.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2525,6 +2531,7 @@ dependencies = [
  "rand_distr",
  "redis",
  "redis-protocol",
+ "reduce",
  "reqwest",
  "rusoto_kms",
  "rusoto_signature",
@@ -2548,6 +2555,7 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
+ "tree-sitter",
  "tree-sitter-cql",
  "uuid",
 ]
@@ -3032,9 +3040,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.20.4"
+version = "0.20.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e34327f8eac545e3f037382471b2b19367725a242bba7bc45edb9efb49fe39a"
+checksum = "9bd4f28f8febb994fca0bb3fd14360ac13cfc7d74d2a56d0f8e0d0e1c1ed7a1a"
 dependencies = [
  "cc",
  "regex",
