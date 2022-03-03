@@ -1,4 +1,5 @@
 use reduce::Reduce;
+use regex::Regex;
 use std::io::Cursor;
 use murmur3::murmur3_x64_128;
 use crate::concurrency::FuturesOrdered;
@@ -7,7 +8,7 @@ use crate::message;
 use crate::message::{Message, Messages, QueryType};
 //use crate::protocols::cassandra_codec::CassandraCodec;
 //use crate::protocols::RawFrame;
-use crate::transforms::util::unordered_cluster_connection_pool::OwnedUnorderedConnectionPool;
+use crate::transforms::util::cluster_connection_pool::ConnectionPool;
 use crate::transforms::util::Request;
 use crate::transforms::{Transform, Transforms, Wrapper};
 use bloomfilter::bloomfilter::{Shape, Simple, BloomFilter};
@@ -36,7 +37,7 @@ use tracing::{info, trace};
 use crate::codec::cassandra::CassandraCodec;
 use crate::frame::{CassandraFrame, CassandraOperation, CQL};
 use tree_sitter::{Language, Parser, Tree, TreeCursor, Node, Query, QueryCursor, QueryCapture, QueryMatch, LogType};
-use proc_macro::TokenTree;
+//use proc_macro::TokenTree;
 use crate::frame::CassandraOperation::Error;
 use crate::transforms::cassandra::bloom_filter::CassandraASTStatementType::{AlterKeyspace, AlterMaterializedView, AlterRole, AlterTable, AlterType, AlterUser, ApplyBatch, CreateAggregate, CreateFunction, CreateIndex, CreateKeyspace, CreateMaterializedView, CreateRole, CreateTable, CreateTrigger, CreateType, CreateUser, DeleteStatement, DropAggregate, DropFunction, DropIndex, DropKeyspace, DropMaterializedView, DropRole, DropTable, DropTrigger, DropType, DropUser, Grant, InsertStatement, ListPermissions, ListRoles, Revoke, SelectStatement, Truncate, Update, UseStatement};
 
@@ -60,34 +61,34 @@ pub struct CassandraBloomFilterTableConfig {
 
 
 #[derive(Debug)]
-pub struct CassandraBloomFilter {
+pub struct CassandraBloomFilter<'stream> {
     /// the outbound connection for this filter
-    outbound: Option<OwnedUnorderedConnectionPool<CassandraCodec>>,
+    //outbound: Option<OwnedUnorderedConnectionPool<CassandraCodec>>,
     /// the name of the chain
     chain_name: String,
     /// a mapping of fully qualified table names to configurations.
     /// Fully qualified => keyspace . table
     tables: HashMap<String, CassandraBloomFilterTableConfig>,
     /// a mapping of messages by stream id.
-    messages : HashMap<StreamId, BloomFilterState>,
+    messages : HashMap<StreamId, BloomFilterState<'stream>>,
 }
 
-impl Clone for CassandraBloomFilter {
+impl <'stream> Clone for CassandraBloomFilter<'stream> {
     fn clone(&self) -> Self {
         CassandraBloomFilter::new(&self.tables, self.chain_name.clone())
     }
 }
 
-impl CassandraBloomFilter {
+impl <'stream> CassandraBloomFilter<'stream> {
     pub fn new(tables: &HashMap<String, CassandraBloomFilterTableConfig>, chain_name: String) -> CassandraBloomFilter {
         let sink_single = CassandraBloomFilter {
             outbound: None,
             chain_name: chain_name.clone(),
             tables: tables.clone(),
-            messages : HashMap.new(),
+            messages : HashMap::new(),
         };
 
-        register_counter!("failed_requests", Unit::Count, "chain" => chain_name, "transform" => sink_single.get_name());
+        //register_counter!("failed_requests", Unit::Count, "chain" => chain_name, "transform" => sink_single.get_name());
 
         sink_single
     }
@@ -99,7 +100,8 @@ impl CassandraBloomFilter {
     /// Create the hasher for a string value
     fn make_hasher(value : String) -> HasherType {
         let hash_result = murmur3_x64_128(&mut Cursor::new(value), 0)?;
-        let mask : u64 = (-1 : i64) as u64;
+        let imask : i64 = -1;
+        let mask : u64 = imask as u64;
         let initial = ((hash_result >> 64) & mask) as u64;
         let incr = (hash_result & mask) as u64;
         SimpleHasher::new( initial, incr )
@@ -120,7 +122,7 @@ impl CassandraBloomFilter {
     /// process the query message.  This method has to handle all possible Queries that could
     /// impact the Bloom filter.
     fn process_query(&self, state : &mut BloomFilterState) -> Message {
-        match ast.statement_type {
+        match state.original_ast.statement_type {
             SelectStatement => self.process_select( state ),
             InsertStatement => self.process_insert(state),
             DeleteStatement => self.process_delete(state),
@@ -135,7 +137,7 @@ impl CassandraBloomFilter {
     fn process_insert(&self, state : &mut BloomFilterState ) -> Message {
         let cfg = self.check_table_name( state );
         match cfg {
-            None => msg,
+            None => state.original_msg,
             Some(config) => {
                 // we need to determine if the bloom filter is being updated if any of the
                 // affected nodes are also updated.
@@ -157,7 +159,7 @@ impl CassandraBloomFilter {
                 // all columns and bloom filter -> ok
                 if !some_columns || has_filter {
                     state.ignore = true;
-                    return msg;
+                    return state.original_msg;
                 }
 
                 // some but not all and no filter
@@ -166,7 +168,7 @@ impl CassandraBloomFilter {
                 }
                 // all the columns in the filter are being inserted and there is no bloom filter provided
                 // so build the filter
-
+                let insert_values_spec: &Node = state.original_ast.search( "insert_values_spec" ).get(0).unwrap();
                 if insert_values_spec.child(0).unwrap().kind().equals( "JSON") {
                     self.make_error( state, "column values may not be set with JSON in inserts for Bloom filter based tables")
                 }
@@ -175,7 +177,7 @@ impl CassandraBloomFilter {
 
                 // assignment_map|assignment_list|assignment_set|assignment_tuple
 
-                let expressions: Box<Vec<Node>> = state.original_ast.search( "insert_values_spec / expression_list / expression" );
+                let expressions: Box<Vec<Node>> = CassandraAST::searchNode(insert_values_spec, "expression_list / expression" );
 
                 // there should be one expression for each column
                 if expressions.len() != columns.len() {
@@ -183,7 +185,7 @@ impl CassandraBloomFilter {
                 }
                 for i in 0..expressions.len() {
                     if config.columns.contains( columns.get(i) ) {
-                        expr :Node = expressions.get(i);
+                        let expr = expressions.get(i).unwrap();
                         if CassandraAST::hasNode(expr, "assignment_map|assignment_list|assignment_set|assignment_tuple") {
                             self.make_error( state, "assignment maps, lists, sets or tuples may not be used to specify values for bloom filter columns.");
                         }
@@ -195,14 +197,14 @@ impl CassandraBloomFilter {
                     k: config.funcs,
                 };
 
-                filter = Simple::from_hasher( &shape, &hashers );
+                let filter = Simple::from_hasher( &shape, &hashers );
                 state.added_values.push( ( config.bloomColumn, CassandraBloomFilter::as_hex( filter )));
             }
         }
-        msg
+        state.original_msg
     }
 
-    fn check_table_name( &self, state : &mut BloomFilterState ) -> Some(CassandraBloomFilterTableConfig) {
+    fn check_table_name( &self, state : &mut BloomFilterState ) -> Option<CassandraBloomFilterTableConfig> {
         let table_name = state.original_ast.get_table_name();
         let cfg = self.tables.get( table_name.as_str() );
         state.ignore = cfg.is_none();
@@ -212,7 +214,7 @@ impl CassandraBloomFilter {
     fn process_delete( &self, state : &mut BloomFilterState ) -> Message {
         let cfg = self.check_table_name( state );
         match cfg {
-            None => msg,
+            None => state.original_msg,
             Some(config) => {
                 // we need to determine if bloom filter columns are being deleted and the
                 // bloom filter not updated
@@ -226,7 +228,7 @@ impl CassandraBloomFilter {
                 // some of the columns and bloom filter -> ok
                 // otherwise error
                 if !some_columns || has_filter {
-                    return msg;
+                    return state.original_msg;
                 }
                 self.make_error( state, "deleting bloom filter columns requires deleting filter")
             }
@@ -246,7 +248,7 @@ impl CassandraBloomFilter {
             additional_info: AdditionalErrorInfo::Invalid,
         });
         let mut new_msg = Message::from_frame( Frame::Cassandra(frame) );
-        new_msg.meta_timestamp = msg.meta_timestamp;
+        new_msg.meta_timestamp = state.original_msg.meta_timestamp;
         new_msg.return_to_sender = true;
         new_msg
     }
@@ -267,7 +269,7 @@ impl CassandraBloomFilter {
                 // the colums we are interested in are in the where clause
                 let column_nodes = state.original_ast.search( "where_spec / relation_elements / column" );
                 // get a list of all the column names.
-                let columns_names : Vec<String> = nodes.iter().map( |n| state.original_ast.node_text(n) ).collect();
+                let column_names : Vec<String> = column_nodes.iter().map( |n| state.original_ast.node_text(n) ).collect();
                 // see if some of the columns are in the bloom filter cnfiguration.
                 let some_columns : bool = column_names.map( |c| config.columns.contains( c )).reduce( |a,b|  a || b);
 
@@ -276,10 +278,10 @@ impl CassandraBloomFilter {
                 // remove the columns from the query so the query will execute.  We will add the columns
                 if some_columns {
                     // see if the bloom filter is in the where clause
-                    let has_filter = columns_names.contains( &config.bloomColumn );
+                    let has_filter = column_names.contains( &config.bloomColumn );
                     // create a list of column node ids in the where clause that match the columns we are interested in
                     let interesting_columns : Vec<usize> = column_nodes.iter()
-                        .filter( |n :Node| config.columns.contains( &ast.node_text(n) ))
+                        .filter( |n :Node| config.columns.contains( state.original_ast.node_text(n) ))
                         .map( |n| n.id() ).collect();
 
                     /*
@@ -305,7 +307,7 @@ impl CassandraBloomFilter {
                      */
 
                     let mut interesting_relations : Vec<Node> = state.original_ast.search( "where_spec / relation_elements[column]" )
-                        .iter().filter( |node| CassandraAST.filterNode( node, |n| interesting_columns.contains( n.id()) ))
+                        .iter().filter( |node| CassandraAST::filterNode( node, |n| interesting_columns.contains( n.id()) ))
                         .collect();
 
                     state.ignore = false;
@@ -337,7 +339,7 @@ impl CassandraBloomFilter {
                             m: config.bits,
                             k: config.funcs,
                         };
-                        filter = Simple::from_hasher( &shape, &hashers );
+                        let filter = Simple::from_hasher( &shape, &hashers );
 
                         state.added_where.push( format!( "{} = {}", config.bloomColumn, CassandraBloomFilter::as_hex( filter ) ) );
                    }
@@ -348,7 +350,7 @@ impl CassandraBloomFilter {
 
             }
         }
-        msg
+        state.original_msg
     }
 
     fn as_hex( producer : & dyn BitMapProducer ) -> String {
@@ -419,7 +421,7 @@ impl CassandraBloomFilter {
                         added_values: vec![]
                     };
                     new_msgs.push(self.process_query( &mut state ));
-                    self.messages.insert(streamId, state);
+                    self.messages.insert(stream, state);
                 },
                 CassandraOperation::Result(result) => {
                     self.process_result(& result, &stream);
@@ -431,13 +433,13 @@ impl CassandraBloomFilter {
         new_msgs
     }
 
-
+/*
     async fn send_message(&mut self, messages: Messages) -> ChainResponse {
         loop {
             match self.outbound {
                 None => {
                     trace!("creating outbound connection {:?}", self.address);
-                    let mut conn_pool = OwnedUnorderedConnectionPool::new(
+                    let mut conn_pool = ConnectionPool::new(
                         self.address.clone(),
                         CassandraCodec::new(),
                     );
@@ -524,24 +526,24 @@ impl CassandraBloomFilter {
             }
         }
     }
-
+*/
 }
 
-pub struct BloomFilterState {
+pub struct BloomFilterState<'a>  {
     ignore: bool,
-    original_msg: QueryMessage,
+    original_msg: Message,
     original_ast: CassandraAST,
-    verify_funcs: Vec<Node>,
-    added_selects: Vec<Node>,
+    verify_funcs: Vec<Node<'a>>,
+    added_selects: Vec<Node<'a>>,
     added_where: Vec<String>,
     added_values: Vec<(String,String)>,
 }
 
-impl BloomFilterState {
+impl <'stream> BloomFilterState<'stream> {
     pub fn rewrite_query( &self ) -> String {
         let mut result = String::new();
         let has_where = self.original_ast.has( "where_spec");
-        _rewrite( self.original_ast.walk(), &result );
+        self._rewrite( self.original_ast.walk(), &result );
         if !has_where && ! self.added_where.is_empty() {
             result.push_str( " WHERE ");
             self.added_where.for_each( |s| result.push_str(  format!( " AND {}", s  ).as_str()));
@@ -551,14 +553,14 @@ impl BloomFilterState {
 
     fn _rewrite(&self, cursor : &mut TreeCursor , result : &mut String) {
         let skip = self.verify_funcs.contains( cursor.node() );
-        if (!skip) {
+        if !skip {
             if cursor.node().is_named() {
                 result.push_str(self.original_ast.node_text(cursor.node()).as_str())
             }
-            if (cursor.goto_first_child()) {
+            if cursor.goto_first_child() {
                 self._rewrite(cursor, result);
             }
-            if (cursor.goto_next_sibling()) {
+            if cursor.goto_next_sibling() {
                 self._rewrite(cursor, result);
             }
         }
@@ -586,11 +588,10 @@ impl BloomFilterState {
 }
 
 pub struct CassandraAST {
-    text: [u8],
+    text: String,
     tree: Tree,
     statement_type: CassandraASTStatementType,
     default_keyspace: Option<String>,
-
 }
 
 impl CassandraAST {
@@ -598,7 +599,7 @@ impl CassandraAST {
     /// create an AST from the query string
     pub fn new(cassandra_statement : String) ->CassandraAST {
         let language = tree_sitter_cql::language();
-        let mut parser = tree_sitter_cql::Parser::new();
+        let mut parser = tree_sitter::Parser::new();
         if parser.set_language(language).is_err() {
             panic!("language version mismatch");
         }
@@ -610,7 +611,7 @@ impl CassandraAST {
         }
         parser.set_logger( Some( Box::new( log)) );
         */
-        let tree = parser.parse(source_code, None).unwrap();
+        let tree = parser.parse(cassandra_statement, None).unwrap();
 
         CassandraAST {
             text : *cassandra_statement.as_bytes(),
@@ -653,7 +654,7 @@ impl CassandraAST {
     }
 
     pub fn search(&self, path : &'static str) -> Box<Vec<Node>> {
-        CassandraAST::searchNode(self.tree.root_node(), str)
+        CassandraAST::searchNode(self.tree.root_node(), path)
     }
 
     // TODO move this to tree-sitter-cql or other external location.
@@ -661,7 +662,7 @@ impl CassandraAST {
         let mut nodes = Box::new(vec![node]);
         for segment in path.split('/').map(|tok| tok.trim()) {
             let mut newNodes = Box::new(vec![]);
-            let pattern = Pattern::from_str( segment );
+            let pattern = SearchPattern::from_str( segment );
             for node in nodes.iter() {
                 CassandraAST::_find(&mut newNodes, *node, &pattern );
             }
@@ -717,7 +718,7 @@ impl CassandraAST {
     }
 
     pub fn filter(&self,  f : fn(Node)->bool ) -> Vec<Node> {
-        CassandraAST::extractNode(self.tree.root_node(), ids )
+        CassandraAST::extractNode(self.tree.root_node(), f )
     }
 
     pub fn apply(&self, selector : fn(Node)->bool, action : fn(Node) ) {
@@ -725,7 +726,7 @@ impl CassandraAST {
     }
 
     pub fn applyNode(node : Node, selector : fn(Node)->bool, action : fn(Node) ) {
-        if f( node ) {
+        if selector( node ) {
             action(node);
         }
         if node.child_count() > 0 {
@@ -736,7 +737,7 @@ impl CassandraAST {
     }
 
     pub fn filterNode(node : Node, selector : fn(Node) ->bool ) -> bool {
-        if f( node ) {
+        if selector( node ) {
             true
         } else {
             if node.child_count() > 0 {
@@ -767,7 +768,7 @@ impl SearchPattern {
     pub fn from_str( pattern : &str ) -> SearchPattern {
         let parts : Vec<&str> = pattern.split("[").collect();
         let namePat = format!("^{}$", parts[0].trim() );
-        Pattern {
+        SearchPattern {
             name : Regex::new(  namePat.as_str() ).unwrap(),
             child : if parts.len()==2 {
                 let name : Vec<&str> = parts[1].split("]").collect();

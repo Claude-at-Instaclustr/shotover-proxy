@@ -34,7 +34,7 @@ tokio-openssl = "0.6.2"
 openssl = { version = "0.10.36", features = ["vendored"] }
 async-recursion = "1.0"
 reduce = "0.1.4"
-
+regex = "1"
 # Error handling
 thiserror = "1.0"
 anyhow = "1.0.31"

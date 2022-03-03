@@ -2532,6 +2532,7 @@ dependencies = [
  "redis",
  "redis-protocol",
  "reduce",
+ "regex",
  "reqwest",
  "rusoto_kms",
  "rusoto_signature",
