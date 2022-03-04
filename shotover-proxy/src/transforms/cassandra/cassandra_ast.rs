@@ -95,9 +95,9 @@ pub struct CassandraAST {
     /// The query string
     text: String,
     /// the tree-sitter tree
-    tree: Tree,
+    pub(crate) tree: Tree,
     /// the statement type of the query
-    statement_type: CassandraASTStatementType,
+    pub statement_type: CassandraASTStatementType,
     /// The default keyspace if set.  Used when keyspace not specified in query.
     default_keyspace: Option<String>,
 }
@@ -124,7 +124,7 @@ impl<'tree> CassandraAST {
             statement_type: if tree.root_node().has_error() {
                 CassandraASTStatementType::UNKNOWN(cassandra_statement.clone())
             } else {
-                CassandraAST::get_statement_type(&tree)
+                CassandraAST::extract_statement_type(&tree)
             },
             default_keyspace: None,
             text: cassandra_statement,
@@ -377,7 +377,7 @@ impl<'tree> CassandraAST {
     /// * `tree` the tree to extract the statement type from.
     ///
     /// returns a `CassandraASTStatementType` for the statement.
-    pub fn get_statement_type(tree: &Tree) -> CassandraASTStatementType {
+    pub fn extract_statement_type(tree: &Tree) -> CassandraASTStatementType {
         let mut node = tree.root_node();
         if node.kind().eq("source_file") {
             node = node.child(0).unwrap();
