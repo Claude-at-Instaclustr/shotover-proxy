@@ -385,14 +385,29 @@ impl<'tree> CassandraAST {
         CassandraASTStatementType::from_node(&node)
     }
 }
+/// The SearchPattern object used for string pattern matching
 pub struct SearchPattern {
+    /// the plain text version of the name to search for.
     pub name_str: String,
+    /// the regex version of the name to search for.
     pub name: Regex,
+    /// the plain text version of  the child name to search for
     pub child_str: Option<String>,
+    /// the regex version of the child name to search for.
     pub child: Option<Regex>,
 }
 
 impl SearchPattern {
+    /// Creates a SearchPattern from a string.
+    ///
+    /// The string is a series of names separated by slashes
+    /// (e.g. ` foo / bar` )  This will match all `bar`s somewhere under
+    /// `foo`.
+    /// The string is a regular expression so `foo|bar` will match either 'foo' or 'bar'.
+    ///
+    /// There is a child pattern (also a regular expression) that will verify if a node has
+    /// the child but still retur nthe node.  (e.g. `foo[bar]` will return all `foo` nodes
+    /// that have a `bar` somewhere below them.
     pub fn from_str(pattern: &str) -> SearchPattern {
         let parts: Vec<&str> = pattern.split("[").collect();
         let name_pattern = format!("^{}$", parts[0].trim());
