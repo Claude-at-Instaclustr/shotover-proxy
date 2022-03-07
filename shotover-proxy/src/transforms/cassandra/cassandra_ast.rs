@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use regex::Regex;
 use tree_sitter::{
     Language, LogType, Node, Parser, Query, QueryCapture, QueryCursor, QueryMatch, Tree, TreeCursor,
@@ -38,15 +39,75 @@ pub enum CassandraASTStatementType {
     ListPermissions,
     ListRoles,
     Revoke,
-    SelectStatement,
+    SelectStatement {
+        modifiers : SelectModifiers,
+        table_name: String,
+        elements : Vec<Element>,
+        where_clause : Vec<RelationElement>,
+        order : Option<OrderClause>,
+    },
     Truncate,
     Update,
     UseStatement,
     UNKNOWN(String),
 }
 
+enum Element {
+    STAR,
+    DOT_STAR(String),
+    COLUMN{
+        name : String,
+        alias : Option<String>,
+    },
+    FUNCTION {
+        name : String,
+        args : String,
+        alias : Option<String>,
+    },
+}
+
+struct OrderClause {
+    name : String,
+    desc : bool,
+}
+
+struct RelationElement {
+    obj : RelationValue,
+    oper : Operator,
+    value : RelationValue,
+}
+
+enum RelationValue {
+    CONST(String),
+    FUNC(String),
+    COL(String),
+    LIST{
+        values : Vec<RelationValue>,
+    },
+
+}
+
+enum Operator {
+    LT,
+    LE,
+    EQ,
+    NE,
+    GE,
+    GT,
+    IN,
+    CONTAINS(String),
+    CONTAINS_KEY(String),
+}
+
+struct SelectModifiers {
+    distinct : bool,
+    json : bool,
+    limit : Option<i32>,
+    filtering : bool,
+}
+
 impl CassandraASTStatementType {
-    pub fn from_node(node: &Node) -> CassandraASTStatementType {
+    pub fn from_node(node: &Node, source : &String) -> CassandraASTStatementType {
         let kind = node.kind();
         match kind {
             "alter_keyspace" => CassandraASTStatementType::AlterKeyspace,
@@ -82,11 +143,120 @@ impl CassandraASTStatementType {
             "list_permissions" => CassandraASTStatementType::ListPermissions,
             "list_roles" => CassandraASTStatementType::ListRoles,
             "revoke" => CassandraASTStatementType::Revoke,
-            "select_statement" => CassandraASTStatementType::SelectStatement,
+            "select_statement" => build_select_statement(node, source),
             "truncate" => CassandraASTStatementType::Truncate,
             "update" => CassandraASTStatementType::Update,
             "use" => CassandraASTStatementType::UseStatement,
             _ => CassandraASTStatementType::UNKNOWN(node.kind().to_string()),
+        }
+    }
+
+    fn build_select_statement(& cursor :TreeCursor, source : &String ) -> CassandraASTStatementType::SelectStatement {
+        let mut walker = CursorWalker::new(cursor );
+        let mut prelude = true;
+        let mut elements = false;
+        let mut from = false;
+        let mut where_ = false;
+        let mut suffix = false;
+
+
+        let mut modifiers = SelectModifiers{
+            distinct : false,
+            json : false,
+            limit : None,
+            filtering : false,
+        };
+        let mut element_list:Vec<Element> = vec!();
+        let mut table_name = String::new();
+        let mut where_clause :Vec<RelatinElement> = vec!();
+        let mut order = None;
+
+        let mut next = walker.next();
+        while next.is_some() {
+            let node = next.unwrap();
+            if prelude {
+                modifiers.distinct = modifiers.distinct || node.kind().eq("DISTINCT");
+                modifiers.json = modifiers.json || node.kind().eq( "JSON");
+                elements = node.kind().eq( "select_elements");
+                prelude = !elements;
+            }
+            if elements {
+                if  node.kind().eq( "select_element") {
+                    element_list.push( parse_select_element( node, source ));
+                }
+                from = node.kind().eq( "from_spec");
+                elements = !from;
+            }
+            if from {
+                if node.kind().eq("keyspace") {
+                    table_name.push_str( node.utf8_text( source.as_bytes()));
+                    table_name.push('.')
+                }
+                if node.kind().eq("table") {
+                    table_name.push_str(node.utf8_text(source.as_bytes()))
+                }
+                where_ = node.kind().eq("where_spec");
+                from = !where_;
+            }
+            if where_ {
+                if  node.kind().eq( "relation_element") {
+                    where_clause.push( parse_relation_element( node, source ));
+                }
+                suffix = node.kind().eq("order_spec") || node.kind().eq("limit_spec") ||
+                    node.kind().eq("ALLOW");
+                where_ = !suffix;
+            }
+            if suffix {
+                if node.kind().eq("limit_value") {
+                    modifiers.limit = node.utf8_text(source.as_bytes());
+                } else if node.kind().eq("ORDER") {
+                    order = parse_order_by( node, source );
+                }
+                modifiers.filtering = modifiers.filtering || node.kind().eq( "FILTERING");
+            }
+            next = walker.next();
+        }
+        CassandraASTStatementType::SelectStatement {
+            modifiers,
+            table_name,
+            elements : element_list,
+            where_clause ,
+            order,
+        }
+    }
+
+    fn parse_order_by( node : &Node, source : &String ) -> OrderClause {
+        OrderClause {
+            name: node.child(2).unwrap().utf8_text(source.as_bytes()),
+            desc: node.child_count()> 3 &&
+                node.child(3).unwrap().utf8_text(source.as_bytes()).eq("DESC"),
+        }
+    }
+
+    fn parse_select_element( node : &Node, source : &String )  -> Element {
+
+        let mut alias :Option<String> = None;
+        let type_ = node.child(0).unwrap();
+        let is_column = type_.kind().eq("column");
+        if node.child_count() > 2 {
+            if type_.kind().eq("column") || type_.kind().eq("function_call") {
+                alias = Some( node.child(2).unwrap().utf8_text( source.as_bytes() ).unwrap().to_string() );
+            }
+        }
+        if type_.kind().eq("column") {
+            Element::COLUMN {
+                name: type_.utf8_text(source.as_bytes()).unwrap().to_string(),
+                alias: alias,
+            }
+        } else if type_.kind().eq("function_call") {
+            Element::FUNCTION {
+                name: type_.utf8_text(source.as_bytes()).unwrap().to_string(),
+                alias: alias,
+            }
+        } else if type_kind().eq("*") {
+            Element::STAR
+        } else {
+            Element::DOT_STAR( type_.utf8_text(source.as_bytes()).unwrap().to_string() )
         }
     }
 }
@@ -102,7 +272,7 @@ pub struct CassandraAST {
     default_keyspace: Option<String>,
 }
 
-impl<'tree> CassandraAST {
+impl CassandraAST {
     /// create an AST from the query string
     pub fn new(cassandra_statement: String) -> CassandraAST {
         let language = tree_sitter_cql::language();
@@ -124,7 +294,7 @@ impl<'tree> CassandraAST {
             statement_type: if tree.root_node().has_error() {
                 CassandraASTStatementType::UNKNOWN(cassandra_statement.clone())
             } else {
-                CassandraAST::extract_statement_type(&tree)
+                CassandraAST::extract_statement_type(&tree, &cassandra_statement)
             },
             default_keyspace: None,
             text: cassandra_statement,
@@ -173,8 +343,9 @@ impl<'tree> CassandraAST {
     /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
     ///
     /// returns a vector of matching nodes.
-    pub fn search(&self, path: &'static str) -> Box<Vec<Node>> {
-        CassandraAST::search_node(&self.tree.root_node(), path)
+    ///
+    pub fn search<'a>(&'a self, path: &'static str) -> Box<Vec<Node<'a>>> {
+        CassandraAST::search_cursor(self.tree.walk(), path)
     }
 
     /// Retrieves all the nodes that match the end of the path starting at the specified node.
@@ -183,7 +354,7 @@ impl<'tree> CassandraAST {
     /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
     ///
     /// returns a vector of matching nodes.
-    pub fn search_node(node: &Node<'tree>, path: &'static str) -> Box<Vec<Node<'tree>>> {
+    pub fn search_node<'a>(node: &'a Node, path: &'static str) -> Box<Vec<Node<'a>>> {
         let mut nodes = Box::new(vec![*node]);
         for segment in path.split('/').map(|tok| tok.trim()) {
             let mut found_nodes = Box::new(Vec::new());
@@ -196,10 +367,29 @@ impl<'tree> CassandraAST {
         nodes
     }
 
+    /// Retrieves all the nodes that match the end of the path starting at the specified node.
+    ///
+    /// * `node` The node to start searching from.
+    /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
+    ///
+    /// returns a vector of matching nodes.
+    pub fn search_cursor<'a>(cursor : TreeCursor<'a>, path: &'static str) -> Box<Vec<Node<'a>>> {
+        let mut nodes = Box::new(vec![cursor.node()]);
+        for segment in path.split('/').map(|tok| tok.trim()) {
+            let mut found_nodes = Box::new(Vec::new());
+            let pattern = SearchPattern::from_str(segment);
+            for node in nodes.iter() {
+                CassandraAST::_find(&mut found_nodes, &mut node.walk(), &pattern);
+            }
+            nodes = found_nodes;
+        }
+        nodes
+    }
+
     // performs a recursive search in the tree
-    fn _find(
-        nodes: &mut Vec<Node<'tree>>,
-        cursor: &mut TreeCursor<'tree>,
+    fn _find<'a>(
+        nodes: & mut Vec<Node<'a>>,
+        cursor: & mut TreeCursor<'a>,
         pattern: &SearchPattern,
     ) {
         let node = cursor.node();
@@ -266,16 +456,16 @@ impl<'tree> CassandraAST {
     /// * selector a `fn(Node)` that returns true for matching elements.
     ///
     /// returns `true` if there is at least one matching node, `false` otherwise
-    pub fn extract_node(node: Node<'tree>, selector: fn(Node) -> bool) -> Vec<Node<'tree>> {
-        let mut result: Vec<Node<'tree>> = vec![];
+    pub fn extract_node(node: Node, selector: fn(Node) -> bool) -> Vec<Node> {
+        let mut result: Vec<Node> = vec![];
         CassandraAST::_extract_cursor(&mut node.walk(), selector, &mut result);
         result
     }
 
-    fn _extract_cursor(
-        cursor: &mut TreeCursor<'tree>,
+    fn _extract_cursor<'a>(
+        cursor: &mut TreeCursor<'a>,
         selector: fn(Node) -> bool,
-        result: &mut Vec<Node<'tree>>,
+        result: &mut Vec<Node<'a>>,
     ) {
         if selector(cursor.node()) {
             result.push(cursor.node());
@@ -299,19 +489,19 @@ impl<'tree> CassandraAST {
     }
     /*
         pub fn apply<F>(&'tree self, selector : fn(Node)->bool, mut action : F ) where
-            F : FnMut(Node<'tree>)  + Copy,
+            F : FnMut(Node)  + Copy,
         {
             CassandraAST::apply_node(self.tree.root_node(), selector, action );
         }
 
-        pub fn apply_node<F>(node : Node<'tree>, selector : fn(Node) ->bool, mut action : F ) where
-            F : FnMut(Node<'tree>)  + Copy,
+        pub fn apply_node<F>(node : Node, selector : fn(Node) ->bool, mut action : F ) where
+            F : FnMut(Node)  + Copy,
         {
             CassandraAST::apply_cursor(&mut node.walk(), selector,  action);
         }
 
-        pub fn apply_cursor<F>(cursor : &mut TreeCursor<'tree>, selector : fn(Node) ->bool, mut action : F ) where
-            F : FnMut(Node<'tree>),
+        pub fn apply_cursor<F>(cursor : &mut TreeCursor, selector : fn(Node) ->bool, mut action : F ) where
+            F : FnMut(Node),
         {
             if selector( cursor.node() ) {
                 action(cursor.node());
@@ -331,8 +521,9 @@ impl<'tree> CassandraAST {
     /// * selector a `fn(Node)` that returns true for matching elements.
     ///
     /// Returns `true` if there is a match, `false` otherwise.
-    pub fn contains(&self, selector: fn(Node) -> bool) -> bool {
-        CassandraAST::contains_node(self.tree.root_node(), selector)
+    pub fn contains<F: Fn(&Node)->bool>(&self, selector: F) -> bool
+    {
+        CassandraAST::contains_node(&self.tree.root_node(), selector)
     }
 
     ///  determines if any node from the provided node down matches the selector.
@@ -341,8 +532,9 @@ impl<'tree> CassandraAST {
     /// * selector a `fn(Node)` that returns true for matching elements.
     ///
     /// Returns `true` if there is a match, `false` otherwise.
-    pub fn contains_node(node: Node, selector: fn(Node) -> bool) -> bool {
-        CassandraAST::contains_cursor(&mut node.walk(), selector)
+    pub fn contains_node<F: Fn(&Node)->bool>(node: &Node, selector: F ) -> bool
+    {
+        CassandraAST::contains_cursor(node.walk(), selector)
     }
 
     ///  determines if any node from the cursor position down matches the selector.
@@ -351,23 +543,18 @@ impl<'tree> CassandraAST {
     /// * selector a `fn(Node)` that returns true for matching elements.
     ///
     /// Returns `true` if there is a match, `false` otherwise.
-    pub fn contains_cursor(cursor: &mut TreeCursor, selector: fn(Node) -> bool) -> bool {
-        if selector(cursor.node()) {
-            return true;
-        } else {
-            if cursor.goto_first_child() {
-                if CassandraAST::contains_cursor(cursor, selector) {
-                    cursor.goto_parent();
-                    return true;
-                }
-                while cursor.goto_next_sibling() {
-                    if CassandraAST::contains_cursor(cursor, selector) {
-                        cursor.goto_parent();
-                        return true;
-                    }
-                }
-                cursor.goto_parent();
+    pub fn contains_cursor<F: Fn(&Node)->bool>( cursor: TreeCursor,  selector: F) -> bool
+    {
+        let mut walker = CursorWalker::new( cursor );
+        let mut next = walker.next();
+        while next.is_some() {
+            let n = next.unwrap();
+            let k = n.kind();
+            let i = n.id();
+            if selector(&n) {
+                return true;
             }
+            next = walker.next();
         }
         false
     }
@@ -377,14 +564,58 @@ impl<'tree> CassandraAST {
     /// * `tree` the tree to extract the statement type from.
     ///
     /// returns a `CassandraASTStatementType` for the statement.
-    pub fn extract_statement_type(tree: &Tree) -> CassandraASTStatementType {
+    pub fn extract_statement_type(tree: &Tree, source : &String ) -> CassandraASTStatementType {
         let mut node = tree.root_node();
         if node.kind().eq("source_file") {
             node = node.child(0).unwrap();
         }
-        CassandraASTStatementType::from_node(&node)
+        CassandraASTStatementType::from_node(&node, source)
     }
 }
+
+struct CursorWalker<'a> {
+    cursor : TreeCursor<'a>,
+    id : usize,
+    next : Option<Node<'a>>,
+}
+
+impl <'a> CursorWalker<'a> {
+    fn new(cursor : TreeCursor<'a>) -> CursorWalker<'a> {
+        CursorWalker {
+            id : cursor.node().id(),
+            next : Some(cursor.node()),
+            cursor,
+        }
+    }
+
+    fn next(&mut self) -> Option<Node<'a>> {
+        let result = self.next;
+        self.next = None;
+        if result.is_some() {
+            if self.cursor.goto_first_child() {
+                self.next = Some(self.cursor.node());
+            } else if self.cursor.goto_next_sibling() {
+                self.next = Some(self.cursor.node());
+            }
+            let mut scanning = self.cursor.node().id() != self.id;
+            while scanning && self.next.is_none() {
+                self.cursor.goto_parent();
+                if self.cursor.node().id() == self.id {
+                    scanning = false;
+                    self.next = None;
+                }
+                if scanning && self.cursor.goto_next_sibling() {
+                    self.next = Some( self.cursor.node());
+                    scanning = false;
+                }
+            }
+
+        }
+        result
+    }
+}
+
+
 /// The SearchPattern object used for string pattern matching
 pub struct SearchPattern {
     /// the plain text version of the name to search for.
@@ -590,8 +821,13 @@ mod tests {
         let ast = CassandraAST::new("SELECT column AS column2, func(*) AS func2, col3 FROM table where col3 = 6".to_string());
         // the above will produce the following tree
         // (source_file (select_statement (select_elements (select_element) (select_element (function_call)) (select_element)) (from_spec (table_name)) (where_spec (relation_elements (relation_element (constant))))))
-        assert!(ast.contains( |n:Node| n.is_named() ));
-        assert!(!ast.contains(|n:Node| false ));
+        let selector = |n:&Node| n.is_named();
+        assert!(ast.contains( selector ));
+        assert!(!ast.contains( |_| {return false;} ));
+        let selector = |n:&Node| n.kind().eq( "AS");
+        assert!(ast.contains( selector ));
+
+
     }
 
     #[test]
@@ -601,7 +837,7 @@ mod tests {
         // (source_file (select_statement (select_elements (select_element) (select_element (function_call)) (select_element)) (from_spec (table_name)) (where_spec (relation_elements (relation_element (constant))))))
         let result =ast.extract( |n:Node| n.kind().eq( "AS") );
         assert_eq!( 2, result.len() );
-        let result = ast.extract(|n:Node| false );
+        let result = ast.extract( |_|{ return false; } );
         assert!( result.is_empty() );
     }
 
