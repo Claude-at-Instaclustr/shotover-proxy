@@ -1,11 +1,14 @@
 use std::borrow::Borrow;
+use itertools::Itertools;
+use pktparse::arp::Operation;
 use regex::Regex;
 use tree_sitter::{
     Language, LogType, Node, Parser, Query, QueryCapture, QueryCursor, QueryMatch, Tree, TreeCursor,
 };
+use crate::transforms::cassandra::cassandra_ast::RelationValue::COL;
 
 #[derive(PartialEq, Debug, Clone)]
-pub enum CassandraASTStatementType {
+pub enum CassandraStatement {
     AlterKeyspace,
     AlterMaterializedView,
     AlterRole,
@@ -35,59 +38,353 @@ pub enum CassandraASTStatementType {
     DropType,
     DropUser,
     Grant,
-    InsertStatement,
+    InsertStatement(InsertStatementData),
     ListPermissions,
     ListRoles,
     Revoke,
-    SelectStatement {
-        modifiers : SelectModifiers,
-        table_name: String,
-        elements : Vec<Element>,
-        where_clause : Vec<RelationElement>,
-        order : Option<OrderClause>,
-    },
-    Truncate,
+    SelectStatement(SelectStatementData),
+    Truncate(String),
     Update,
-    UseStatement,
+    UseStatement(String),
     UNKNOWN(String),
 }
 
-enum Element {
-    STAR,
-    DOT_STAR(String),
-    COLUMN{
-        name : String,
-        alias : Option<String>,
-    },
-    FUNCTION {
-        name : String,
-        args : String,
-        alias : Option<String>,
-    },
+#[derive(PartialEq, Debug, Clone)]
+pub struct InsertStatementData {
+    pub begin_batch : Option<BeginBatch>,
+    pub modifiers : StatementModifiers,
+    pub table_name: String,
+    pub columns: Option<Vec<String>>,
+    pub values: Option<InsertValues>,
+    pub using_ttl : Option<TtlTimestamp>
 }
 
-struct OrderClause {
+impl ToString for InsertStatementData {
+    fn to_string(&self) -> String {
+        let mut result = String::new();
+        if self.begin_batch.is_some() {
+            result.push_str( self.begin_batch.as_ref().unwrap().to_string().as_str() );
+        }
+        result.push_str( "INSERT INTO ");
+        result.push_str( &self.table_name.as_str() );
+        if self.columns.is_some() {
+            result.push( '(' );
+            result.push_str( self.columns.as_ref().unwrap().iter().join(",").as_str());
+            result.push_str( ")" );
+        }
+        result.push_str( self.values.as_ref().unwrap().to_string().as_str() );
+        if self.modifiers.not_exists {
+            result.push_str( " IF EXISTS");
+        }
+        if self.using_ttl.is_some() {
+            result.push_str( self.using_ttl.as_ref().unwrap().to_string().as_str());
+        }
+        result
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct TtlTimestamp {
+    ttl : u64,
+    timestamp : u64,
+}
+
+impl ToString for TtlTimestamp {
+    fn to_string(&self) -> String {
+        format!("USING TTL {} AND TIMESTAMP {}", self.ttl, self.timestamp)
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct BeginBatch {
+    logged: bool,
+    unlogged: bool,
+    timestamp: Option<u64>,
+}
+
+impl BeginBatch {
+    pub fn new() -> BeginBatch {
+        BeginBatch {
+            logged: false,
+            unlogged: false,
+            timestamp: None,
+        }
+    }
+}
+impl ToString for BeginBatch {
+    fn to_string(&self) -> String {
+        let mut result = format!( "BEGIN{}BATCH ", if self.logged {
+            " LOGGED "
+        } else if self.unlogged {
+            " UNLOGGED "
+        } else {
+            " "
+        }).to_string();
+        if (self.timestamp.is_some()) {
+            result.push_str( format!( "USING TIMESTAMP {} ", self.timestamp.unwrap()).as_str());
+        }
+        result
+    }
+
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum InsertValues {
+    VALUES(Vec<InsertExpression>),
+    JSON(String),
+}
+
+impl ToString for InsertValues {
+    fn to_string(&self) -> String {
+        match self {
+            InsertValues::VALUES(columns) => {
+                let mut result = String::from( " VALUES ");
+                result.push_str(columns.iter().map( |c| c.to_string() ).join(",").as_str());
+                result
+            },
+            InsertValues::JSON(text) => {
+                format!( "JSON {}", text ).to_string()
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum InsertExpression {
+    CONST(String),
+    MAP(Vec<(String,String)>),
+    SET(Vec<String>),
+    LIST(Vec<String>),
+    TUPLE(TupleStruct)
+}
+
+impl ToString for InsertExpression {
+    fn to_string(&self) -> String {
+        match self {
+            InsertExpression::CONST(text) => text.clone(),
+            InsertExpression::MAP(entries) => {
+                let mut result = String::from('{');
+                result.push_str(entries.iter().map( |(x,y)| format!("{}:{}", x, y )).join(",").as_str());
+                result.push('}');
+                result
+            },
+            InsertExpression::SET(values) => {
+                let mut result = String::from('{');
+                result.push_str(values.iter().join(",").as_str());
+                result.push('}');
+                result
+            },
+            InsertExpression::LIST(values) => {
+                let mut result = String::from('[');
+                result.push_str(values.iter().join(",").as_str());
+                result.push(']');
+                result
+            },
+            InsertExpression::TUPLE(values) => {
+                values.to_string()
+            },
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct TupleStruct {
+    constant : String,
+    constant_list : Option<Vec<String>>,
+    tuple_list : Option<Vec<TupleStruct>>
+}
+
+
+impl ToString for TupleStruct {
+    fn to_string(&self) -> String {
+        let mut result = String::from('(');
+        result.push_str(self.constant.as_str());
+        if (self.constant_list.is_some()) {
+            result.push_str( self.constant_list.as_ref().unwrap().iter().join(",").as_str() );
+        } else if (self.tuple_list.is_some()) {
+            for t in self.tuple_list.as_ref().unwrap().iter().map(|t| t.to_string() ) {
+                result.push_str(t.as_str());
+            }
+        }
+        result.push(')');
+        result
+    }
+}
+
+/*
+        assignment_map : $ => seq("{", commaSep1( seq( $.constant, ":", $.constant)),"}"),
+        assignment_set : $ => seq("{", optional( commaSep1( $.constant ) ),"}"),
+        assignment_list : $  => seq( "[", commaSep1( $.constant ), "]"),
+
+        assignment_tuple : $ =>
+            seq(
+                "(",
+                $.constant,
+                choice(
+                    repeat( seq( ",", $.constant)),
+                    repeat( seq( ",", $.assignment_tuple)),
+                    commaSep1( $.assignment_tuple ),
+                ),
+                ")",
+            ),
+
+        assignment_map : $ => seq("{", commaSep1( seq( $.constant, ":", $.constant)),"}"),
+        assignment_set : $ => seq("{", optional( commaSep1( $.constant ) ),"}"),
+        assignment_list : $  => seq( "[", commaSep1( $.constant ), "]"),
+*/
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct SelectStatementData {
+    pub modifiers : StatementModifiers,
+    pub table_name: String,
+    pub elements : Vec<SelectElement>,
+    pub where_clause : Vec<RelationElement>,
+    pub order : Option<OrderClause>,
+}
+
+impl SelectStatementData {
+    /// return the column names selected
+    pub fn select_names(&self ) -> Vec<String> {
+        self.elements.iter().map( |e| match e {
+            SelectElement::STAR => None,
+            SelectElement::DOT_STAR(_) => None,
+            SelectElement::COLUMN(named) => Some(named.name.clone()),
+            SelectElement::FUNCTION(_) => None,
+        }).filter( |e| e.is_some() ).map( |e| e.unwrap()).collect()
+    }
+
+    /// return the aliased column names.  If the column is not aliased the
+    /// base column name is returned.
+    pub fn select_alias(&self ) -> Vec<String> {
+        self.elements.iter().map( |e| match e {
+            SelectElement::COLUMN( named ) => if named.alias.is_some() {
+                named.alias.clone()
+                //Some(named.alias..as_ref().unwrap().clone())
+            } else {
+                Some(named.name.clone())
+            },
+            _ => None
+        }).filter( |e| e.is_some()).map(|e| e.unwrap()).collect()
+    }
+    /// return the column names selected
+    pub fn where_columns(&self ) -> Vec<String> {
+        self.where_clause.iter().map( |e| match &e.obj {
+            COL(name) => Some(name.clone()),
+            _ => None,
+        }).filter( |e| e.is_some()).map( |e| e.unwrap()).collect()
+    }
+}
+
+impl ToString for SelectStatementData {
+    fn to_string(&self) -> String {
+        let mut result = String::new();
+        result.push_str( "SELECT ");
+        if self.modifiers.distinct {
+            result.push_str( "DISTINCT ");
+        }
+        if self.modifiers.json {
+            result.push_str( "JSON ");
+        }
+        result.push_str( self.elements.iter().map( |e| e.to_string() ).join(",").as_str() );
+        result.push_str( " FROM ");
+        result.push_str( self.table_name.as_str() );
+        result.push_str( " WHERE ");
+        result.push_str( self.where_clause.iter().map( |w| w.to_string() ).join(" AND ").as_str());
+        if self.modifiers.limit.is_some() {
+            result.push_str( self.modifiers.limit.unwrap().to_string().as_str() );
+        }
+        if self.modifiers.filtering {
+            result.push_str( " ALLOW FILTERING");
+        }
+        result
+    }
+}
+
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum SelectElement {
+    STAR,
+    DOT_STAR(String),
+    COLUMN(Named),
+    FUNCTION(Named),
+}
+
+impl ToString for SelectElement {
+    fn to_string(&self) -> String {
+        match self {
+            SelectElement::STAR => String::from("*"),
+            SelectElement::DOT_STAR(column) => format!( "{}.*", column).to_string(),
+            SelectElement::COLUMN( named ) |
+            SelectElement::FUNCTION(named) => named.to_string(),
+        }
+    }
+}
+
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct Named {
+    pub(crate) name: String,
+    pub(crate) alias: Option<String>,
+}
+
+impl ToString for Named {
+    fn to_string(&self) -> String {
+        match &self.alias {
+            None => self.name.clone(),
+            Some(a) => format!("{}.{}", a, self.name).to_string(),
+        }
+    }
+}
+
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct OrderClause {
     name : String,
     desc : bool,
 }
 
-struct RelationElement {
-    obj : RelationValue,
-    oper : Operator,
-    value : RelationValue,
+#[derive(PartialEq, Debug, Clone)]
+pub struct RelationElement {
+    /// the column, function or column list on the left side
+    pub obj : RelationValue,
+    /// the relational operator
+    pub oper : RelationOperator,
+    /// the value, func, argument list, tuple list or tuple
+    pub value : RelationValue,
 }
 
-enum RelationValue {
+impl ToString for RelationElement {
+    fn to_string(&self) -> String {
+        format!( "{} {} {}", self.obj.to_string(), self.oper.to_string(), self.value.to_string()).to_string()
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum RelationValue {
     CONST(String),
     FUNC(String),
     COL(String),
-    LIST{
-        values : Vec<RelationValue>,
-    },
-
+    LIST(Vec<RelationValue>),
+}
+impl ToString for RelationValue {
+    fn to_string(&self) -> String {
+        match self {
+            RelationValue::CONST( s ) |
+            RelationValue::FUNC(s) |
+            COL(s) => s.clone(),
+            RelationValue::LIST( lst ) => {
+                let mut result = String::from( "(");
+                result.push_str( lst.iter().map( |e| e.to_string() ).join(" AND ").as_str());
+                result.push( ')');
+                result
+            }
+        }
+    }
 }
 
-enum Operator {
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum RelationOperator {
     LT,
     LE,
     EQ,
@@ -99,175 +396,655 @@ enum Operator {
     CONTAINS_KEY(String),
 }
 
-struct SelectModifiers {
+impl ToString for RelationOperator {
+    fn to_string(&self) -> String {
+        match self {
+            RelationOperator::LT => String::from("<"),
+            RelationOperator::LE => String::from( "<="),
+            RelationOperator::EQ => String::from("="),
+            RelationOperator::NE => String::from("<>"),
+            RelationOperator::GE => String::from(">="),
+            RelationOperator::GT => String::from(">"),
+            RelationOperator::IN => String::from("IN"),
+            RelationOperator::CONTAINS( s ) => format!( "CONTAINS {}", s).to_string(),
+            RelationOperator::CONTAINS_KEY(s) => format!( "CONTAINS KEY {}", s).to_string(),
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct StatementModifiers {
     distinct : bool,
     json : bool,
     limit : Option<i32>,
     filtering : bool,
+    not_exists : bool,
+    exists : bool,
 }
 
-impl CassandraASTStatementType {
-    pub fn from_node(node: &Node, source : &String) -> CassandraASTStatementType {
-        let kind = node.kind();
-        match kind {
-            "alter_keyspace" => CassandraASTStatementType::AlterKeyspace,
-            "alter_materialized_view" => CassandraASTStatementType::AlterMaterializedView,
-            "alter_role" => CassandraASTStatementType::AlterRole,
-            "alter_table" => CassandraASTStatementType::AlterTable,
-            "alter_type" => CassandraASTStatementType::AlterType,
-            "alter_user" => CassandraASTStatementType::AlterUser,
-            "apply_batch" => CassandraASTStatementType::ApplyBatch,
-            "create_aggregate" => CassandraASTStatementType::CreateAggregate,
-            "create_function" => CassandraASTStatementType::CreateFunction,
-            "create_index" => CassandraASTStatementType::CreateIndex,
-            "create_keyspace" => CassandraASTStatementType::CreateKeyspace,
-            "create_materialized_view" => CassandraASTStatementType::CreateMaterializedView,
-            "create_role" => CassandraASTStatementType::CreateRole,
-            "create_table" => CassandraASTStatementType::CreateTable,
-            "create_trigger" => CassandraASTStatementType::CreateTrigger,
-            "create_type" => CassandraASTStatementType::CreateType,
-            "create_user" => CassandraASTStatementType::CreateUser,
-            "delete_statement" => CassandraASTStatementType::DeleteStatement,
-            "drop_aggregate" => CassandraASTStatementType::DropAggregate,
-            "drop_function" => CassandraASTStatementType::DropFunction,
-            "drop_index" => CassandraASTStatementType::DropIndex,
-            "drop_keyspace" => CassandraASTStatementType::DropKeyspace,
-            "drop_materialized_view" => CassandraASTStatementType::DropMaterializedView,
-            "drop_role" => CassandraASTStatementType::DropRole,
-            "drop_table" => CassandraASTStatementType::DropTable,
-            "drop_trigger" => CassandraASTStatementType::DropTrigger,
-            "drop_type" => CassandraASTStatementType::DropType,
-            "drop_user" => CassandraASTStatementType::DropUser,
-            "grant" => CassandraASTStatementType::Grant,
-            "insert_statement" => CassandraASTStatementType::InsertStatement,
-            "list_permissions" => CassandraASTStatementType::ListPermissions,
-            "list_roles" => CassandraASTStatementType::ListRoles,
-            "revoke" => CassandraASTStatementType::Revoke,
-            "select_statement" => build_select_statement(node, source),
-            "truncate" => CassandraASTStatementType::Truncate,
-            "update" => CassandraASTStatementType::Update,
-            "use" => CassandraASTStatementType::UseStatement,
-            _ => CassandraASTStatementType::UNKNOWN(node.kind().to_string()),
+impl StatementModifiers {
+    pub fn new() -> StatementModifiers {
+        StatementModifiers {
+            distinct : false,
+            json : false,
+            limit : None,
+            filtering : false,
+            not_exists : false,
+            exists : false,
         }
     }
+}
 
-    fn build_select_statement(& cursor :TreeCursor, source : &String ) -> CassandraASTStatementType::SelectStatement {
-        let mut walker = CursorWalker::new(cursor );
+struct NodeFuncs {}
+
+impl NodeFuncs {
+    pub fn as_string(node :&Node, source : &String) -> String {
+        node.utf8_text(source.as_bytes()).unwrap().to_string()
+    }
+}
+impl CassandraStatement {
+    pub fn from_node(node: &Node, source: &String) -> CassandraStatement {
+        let kind = node.kind();
+        match kind {
+            "alter_keyspace" => CassandraStatement::AlterKeyspace,
+            "alter_materialized_view" => CassandraStatement::AlterMaterializedView,
+            "alter_role" => CassandraStatement::AlterRole,
+            "alter_table" => CassandraStatement::AlterTable,
+            "alter_type" => CassandraStatement::AlterType,
+            "alter_user" => CassandraStatement::AlterUser,
+            "apply_batch" => CassandraStatement::ApplyBatch,
+            "create_aggregate" => CassandraStatement::CreateAggregate,
+            "create_function" => CassandraStatement::CreateFunction,
+            "create_index" => CassandraStatement::CreateIndex,
+            "create_keyspace" => CassandraStatement::CreateKeyspace,
+            "create_materialized_view" => CassandraStatement::CreateMaterializedView,
+            "create_role" => CassandraStatement::CreateRole,
+            "create_table" => CassandraStatement::CreateTable,
+            "create_trigger" => CassandraStatement::CreateTrigger,
+            "create_type" => CassandraStatement::CreateType,
+            "create_user" => CassandraStatement::CreateUser,
+            "delete_statement" => CassandraStatement::DeleteStatement,
+            "drop_aggregate" => CassandraStatement::DropAggregate,
+            "drop_function" => CassandraStatement::DropFunction,
+            "drop_index" => CassandraStatement::DropIndex,
+            "drop_keyspace" => CassandraStatement::DropKeyspace,
+            "drop_materialized_view" => CassandraStatement::DropMaterializedView,
+            "drop_role" => CassandraStatement::DropRole,
+            "drop_table" => CassandraStatement::DropTable,
+            "drop_trigger" => CassandraStatement::DropTrigger,
+            "drop_type" => CassandraStatement::DropType,
+            "drop_user" => CassandraStatement::DropUser,
+            "grant" => CassandraStatement::Grant,
+            "insert_statement" => CassandraStatement::InsertStatement( CassandraParser::build_insert_statement(node.walk(),source)),
+            "list_permissions" => CassandraStatement::ListPermissions,
+            "list_roles" => CassandraStatement::ListRoles,
+            "revoke" => CassandraStatement::Revoke,
+            "select_statement" => CassandraStatement::SelectStatement( CassandraParser::build_select_statement(node.walk(), source)),
+            "truncate" => {
+                let mut walker = CursorWalker::new( node.walk() );
+                // consume until 'table_name'
+                while !walker.next().unwrap().kind().eq( "table_name") {
+                }
+                CassandraStatement::Truncate( CassandraParser::parse_table_name( &mut walker, source ))
+            },
+            "update" => CassandraStatement::Update,
+            "use" => {
+                let keyspace = CassandraAST::search_node(node, "keyspace");
+                if keyspace.is_empty() {
+                    CassandraStatement::UNKNOWN("Keyspace not provided with USE statement".to_string())
+                } else {
+                    CassandraStatement::UseStatement(NodeFuncs::as_string(keyspace.get(1).unwrap(), source))
+                }
+            },
+            _ => CassandraStatement::UNKNOWN(node.kind().to_string()),
+        }
+    }
+}
+
+struct CassandraParser {}
+impl CassandraParser {
+
+    fn build_insert_statement(mut cursor :TreeCursor, source : &String ) -> InsertStatementData {
+        let mut walker = CursorWalker::new( cursor );
+        let mut begin = false;
+        let mut statement_data = InsertStatementData {
+            begin_batch : None,
+            modifiers : StatementModifiers::new(),
+            table_name: String::from(""),
+            columns: None,
+            values: None,
+            using_ttl : None,
+        };
+
+        let mut next = walker.next();
+        while next.is_some() {
+            let mut node = next.unwrap();
+            let kind = node.kind();
+            match kind {
+                "begin_batch" =>
+                    statement_data.begin_batch = Some(CassandraParser::parse_begin_batch(&mut walker, source)),
+                "table_name" => {
+                    statement_data.table_name = CassandraParser::parse_table_name(&mut walker, source);
+                },
+                "insert_column_spec" => {
+                    // consume the '('
+                    walker.next();
+                    statement_data.columns = Some(CassandraParser::parse_column_list(&mut walker, source, ")"));
+                },
+                "insert_values_spec" => {
+                    match walker.next().unwrap().kind() {
+                        "VALUES" => {
+                            // consume "("
+                            walker.next();
+                            let expression_list = CassandraParser::parse_expression_list(&mut walker, source, ")");
+                            statement_data.values = Some(InsertValues::VALUES(expression_list));
+                        }
+                        "JSON" => {
+                            node = walker.next().unwrap();
+                            statement_data.values= Some(InsertValues::JSON( NodeFuncs::as_string( &node, source ) ));
+                        }
+                        _ => {}
+                    }
+                },
+                "IF" => {
+                    // consumer NOT
+                    walker.next();
+                    // consume EXISTS
+                    walker.next();
+                    statement_data.modifiers.not_exists = true;
+                },
+                "using_ttl_timestamp" => {
+                    statement_data.using_ttl = Some(CassandraParser::parse_ttl_timestamp(&mut walker, source));
+                }
+            _ => {}
+
+            }
+            next = walker.next();
+        }
+        statement_data
+    }
+
+    // on column_list
+    fn parse_column_list(walker : &mut CursorWalker, source : &String, end : &str ) -> Vec<String> {
+        let mut result:Vec<String> = vec!();
+        let mut process = true;
+        while process {
+            let mut node = walker.next().unwrap();
+            match node.kind() {
+                "column" => result.push(NodeFuncs::as_string(&node, source)),
+                end => process = false,
+            }
+        }
+        result
+    }
+
+    fn parse_ttl_timestamp(walker : &mut CursorWalker, source : &String ) -> TtlTimestamp {
+        // consumer "USING"
+        walker.next();
+        let mut ttl :Option<u64>= None;
+        let mut timestamp : Option<u64> = None;
+        while ttl.is_none() || timestamp.is_none() {
+            let mut node = walker.next().unwrap();
+            match node.kind() {
+                "ttl" => {
+                    // consume "TTL"
+                    walker.next();
+                    node = walker.next().unwrap();
+                    ttl = Some(NodeFuncs::as_string(&node, source ).parse::<u64>().unwrap());
+                },
+                "timestamp" => {
+                    // consumer TIMESTAMP
+                    walker.next();
+                    node = walker.next().unwrap();
+                    timestamp = Some(NodeFuncs::as_string(&node, source).parse::<u64>().unwrap());
+                },
+                _ => {},
+            }
+        }
+        TtlTimestamp{ ttl: ttl.unwrap(), timestamp: timestamp.unwrap() }
+    }
+
+    fn parse_table_name(walker : &mut CursorWalker, source : &String ) -> String {
+        let result = NodeFuncs::as_string(&walker.current().unwrap(), source);
+        while ! walker.next().unwrap().kind().eq("table") {
+        }
+        result
+    }
+
+
+
+    fn parse_expression_list(walker : &mut CursorWalker, source : &String, end : &str ) -> Vec<InsertExpression> {
+        let mut result = vec!();
+        let mut next = walker.next();
+        let mut node = next.unwrap();
+        let mut kind = node.kind();
+        while kind.eq("expression") {
+            node = walker.next().unwrap();
+            kind = node.kind();
+            match kind {
+                "assignment_map" => {
+                    // { const : const, ... }
+                    // consume the "{"
+                    let mut entries : Vec<(String,String)> = vec!();
+                    walker.next();
+                    node = walker.next().unwrap();
+                    while node.kind() != "}" {
+                        let key = NodeFuncs::as_string( &node, source );
+                        // consume the ':'
+                        walker.next();
+                        let value = NodeFuncs::as_string( &walker.next().unwrap(), source );
+                        entries.push( (key,value) );
+                        node = walker.next().unwrap();
+                        if node.kind() == "," {
+                            node = walker.next().unwrap();
+                        }
+                    }
+                    result.push( InsertExpression::MAP( entries ));
+                },
+                "assignment_list"=> {
+                    // [ const, const, ... ]
+                    // consume the "["
+                    let mut entries : Vec<String> = vec!();
+                    walker.next();
+                    node = walker.next().unwrap();
+                    while node.kind() != "]" {
+                        entries.push( NodeFuncs::as_string( &node, source ));
+                        node = walker.next().unwrap();
+                        if node.kind() == "," {
+                            node = walker.next().unwrap();
+                        }
+                    }
+                    result.push( InsertExpression::LIST( entries ));
+
+                },
+                "assignment_set"=> {
+                    // { const, const, ... }
+                    // consume the "{"
+                    let mut entries : Vec<String> = vec!();
+                    walker.next();
+                    node = walker.next().unwrap();
+                    while node.kind() != "}" {
+                        entries.push( NodeFuncs::as_string( &node, source ));
+                        node = walker.next().unwrap();
+                        if node.kind() == "," {
+                            node = walker.next().unwrap();
+                        }
+                    }
+                    result.push( InsertExpression::SET( entries ));
+                },
+                "assignment_tuple"=> {
+                    result.push( InsertExpression::TUPLE( CassandraParser::_parse_tuple( walker, source )));
+                },
+                "constant" => result.push(InsertExpression::CONST( NodeFuncs::as_string( &node, source ) )),
+                _ => {},
+            }
+            node = walker.next().unwrap();
+            kind = node.kind();
+            if kind.eq(",") {
+                node = walker.next().unwrap();
+                kind = node.kind();
+            }
+        }
+        result
+
+        /*
+            $.assignment_map,
+                $.assignment_set,
+                $.assignment_list,
+                $.assignment_tuple,
+                    InsertExpression::CONST(text) => text.clone(),
+            InsertExpression::MAP(entries) => {
+                let mut result = String::from('{');
+                result.push_str(entries.iter().map( |(x,y)| format!("{}:{}", x, y )).join(",").as_str());
+                result.push('}');
+                result
+            },
+            InsertExpression::SET(values) => {
+                let mut result = String::from('{');
+                result.push_str(values.iter().join(",").as_str());
+                result.push('}');
+                result
+            },
+            InsertExpression::LIST(values) => {
+                let mut result = String::from('[');
+                result.push_str(values.iter().join(",").as_str());
+                result.push(']');
+                result
+            },
+            InsertExpression::TUPLE(values) => {
+                let mut result = String::from('(');
+                result.push_str(values.iter().map( |x| x.to_string() ).join(",").as_str());
+                result.push(')');
+                result
+            },
+        }
+
+         */
+        /*
+            expression_list : $ => commaSep1( $.expression ),
+        expression : $ =>
+            choice(
+                $.constant,
+                $.assignment_map,
+                $.assignment_set,
+                $.assignment_list,
+                $.assignment_tuple,
+            ),
+
+ */
+    }
+
+    fn _parse_tuple( walker : &mut CursorWalker, source : &String ) -> TupleStruct {
+        // consume the '('
+        walker.next();
+        let mut constant_list = vec!();
+        let mut tuple_list = vec!();
+        let constant =NodeFuncs::as_string( &walker.next.unwrap(), source );
+        let mut node = walker.next.unwrap();
+        let mut kind = node.kind();
+        while ! kind.eq( ")") {
+            match kind {
+                "constant" => {
+                    constant_list.push( NodeFuncs::as_string( &node, source ));
+                },
+                "assignment_tuple" => {
+                    tuple_list.push( CassandraParser::_parse_tuple( walker, source ));
+                },
+                _ => {}
+            }
+            node = walker.next().unwrap();
+            kind = node.kind();
+        }
+        TupleStruct {
+            constant,
+            constant_list: {if constant_list.is_empty() { None } else { Some(constant_list) }},
+            tuple_list: {if tuple_list.is_empty() { None } else { Some(tuple_list) }},
+        }
+    }
+    /// walker on "begin_batch"
+    fn parse_begin_batch( walker : &mut CursorWalker, source : &String ) -> BeginBatch {
+        let mut result = BeginBatch::new();
+        // consume BEGIN
+        walker.next();
+        let mut node = walker.next().unwrap();
+        result.logged = node.kind().eq( "LOGGED");
+        result.unlogged = node.kind().eq( "UNLOGGED");
+        if result.logged || result.unlogged {
+            // used a node so advance
+            walker.next().unwrap();
+        }
+        // consume BATCH
+        walker.next().unwrap();
+        if walker.peek().unwrap().kind().eq( "using_timestamp_spec") {
+            // consume "using_timestamp_spec
+            // consume USING
+            walker.next();
+            // consume TIMESTAMP
+            walker.next();
+            node = walker.next().unwrap();
+            result.timestamp = Some(NodeFuncs::as_string(&node, source ).parse::<u64>().unwrap());
+        }
+        result
+    }
+
+    fn build_select_statement(mut cursor :TreeCursor, source : &String ) -> SelectStatementData {
+        let mut walker = CursorWalker::new( cursor );
         let mut prelude = true;
         let mut elements = false;
         let mut from = false;
         let mut where_ = false;
         let mut suffix = false;
 
-
-        let mut modifiers = SelectModifiers{
-            distinct : false,
-            json : false,
-            limit : None,
-            filtering : false,
+        let mut statement_data = SelectStatementData {
+            modifiers: StatementModifiers::new(),
+            elements: vec!(),
+            table_name: String::new(),
+            where_clause: vec!(),
+            order : None,
         };
-        let mut element_list:Vec<Element> = vec!();
-        let mut table_name = String::new();
-        let mut where_clause :Vec<RelatinElement> = vec!();
-        let mut order = None;
-
         let mut next = walker.next();
         while next.is_some() {
             let node = next.unwrap();
+            let kind = node.kind();
             if prelude {
-                modifiers.distinct = modifiers.distinct || node.kind().eq("DISTINCT");
-                modifiers.json = modifiers.json || node.kind().eq( "JSON");
-                elements = node.kind().eq( "select_elements");
-                prelude = !elements;
-            }
-            if elements {
-                if  node.kind().eq( "select_element") {
-                    element_list.push( parse_select_element( node, source ));
+                match kind {
+                    "DISTINCT" =>  statement_data.modifiers.distinct = true,
+                    "JSON" => statement_data.modifiers.json = true,
+                    "select_elements" => {elements = true;prelude=false},
+                    _ => (),
                 }
-                from = node.kind().eq( "from_spec");
-                elements = !from;
-            }
-            if from {
-                if node.kind().eq("keyspace") {
-                    table_name.push_str( node.utf8_text( source.as_bytes()));
-                    table_name.push('.')
+            } else if elements {
+                match kind {
+                    "select_element" => statement_data.elements.push(CassandraParser::parse_select_element(&mut walker, source)),
+                    "from_spec" => {
+                        elements = false;
+                        from = true;
+                    },
+                    _ => (),
                 }
-                if node.kind().eq("table") {
-                    table_name.push_str(node.utf8_text(source.as_bytes()))
+            } else if from {
+                match kind {
+                    "keyspace" => {
+                        statement_data.table_name.push_str( NodeFuncs::as_string(&node,source ).as_str());
+                        statement_data.table_name.push('.');
+                    },
+                    "table" =>
+                        statement_data.table_name.push_str(node.utf8_text(source.as_bytes()).unwrap()),
+                    "where_spec" => { from = false; where_ = true; },
+                    _ => (),
                 }
-                where_ = node.kind().eq("where_spec");
-                from = !where_;
-            }
-            if where_ {
-                if  node.kind().eq( "relation_element") {
-                    where_clause.push( parse_relation_element( node, source ));
+            } else if where_ {
+                match kind {
+                    "relation_element" =>
+                        statement_data.where_clause.push(CassandraParser::parse_relation_element(&mut walker, source)),
+                    "order_spec" | "limit_spec" | "ALLOW" => { where_ = false; suffix = true;},
+                    _ => (),
                 }
-                suffix = node.kind().eq("order_spec") || node.kind().eq("limit_spec") ||
-                    node.kind().eq("ALLOW");
-                where_ = !suffix;
-            }
-            if suffix {
-                if node.kind().eq("limit_value") {
-                    modifiers.limit = node.utf8_text(source.as_bytes());
-                } else if node.kind().eq("ORDER") {
-                    order = parse_order_by( node, source );
+            } else if suffix {
+                match kind {
+                    "limit_value" => {
+                        let value_str = node.utf8_text(source.as_bytes()).unwrap().to_string();
+                        statement_data.modifiers.limit = Some(value_str.parse::<i32>().unwrap());
+                    },
+                    "order_spec" =>
+                        statement_data.order = CassandraParser::parse_order_by(&mut walker, source ),
+                    "FILTERING" => statement_data.modifiers.filtering = true,
+                    _ => (),
                 }
-                modifiers.filtering = modifiers.filtering || node.kind().eq( "FILTERING");
             }
             next = walker.next();
         }
-        CassandraASTStatementType::SelectStatement {
-            modifiers,
-            table_name,
-            elements : element_list,
-            where_clause ,
-            order,
+        statement_data
+    }
+
+    /// walker positioned on "element_element"
+    fn parse_relation_element( walker : &mut CursorWalker, source : &String ) -> RelationElement {
+
+        RelationElement {
+            obj: CassandraParser::parse_relation_value(walker, source),
+            oper: CassandraParser::parse_operator(walker, source),
+            value: CassandraParser::parse_relation_value(walker, source),
+        }
+    }
+    /// walker positioned before operator symbol
+    fn parse_operator( walker : &mut CursorWalker, source : &String ) -> RelationOperator {
+        let mut node = walker.next().unwrap();
+        let kind = node.kind();
+        match kind {
+            "<" => RelationOperator::LT,
+            "<=" => RelationOperator::LE,
+            "<>" => RelationOperator::NE,
+            "=" => RelationOperator::EQ,
+            ">=" => RelationOperator::GE,
+            ">" => RelationOperator::GT,
+            "IN" => RelationOperator::IN,
+            "CONTAINS" => {
+                if walker.peek().unwrap().kind().eq("KEY") {
+                    // consume the "KEY"
+                    walker.next();
+                    RelationOperator::CONTAINS_KEY( NodeFuncs::as_string(&walker.next().unwrap(), source))
+                } else {
+                    RelationOperator::CONTAINS( NodeFuncs::as_string(&walker.next().unwrap(), source ))
+                }
+            },
+
+            _ => {
+                // can not happen -- so this is a nasty result
+                let mut s = "Unknown operator: ".to_string();
+                s.push_str( kind );
+                RelationOperator::CONTAINS( s )
+            },
+        }
+    }
+    /// walker must be positioned at the start of the relation value
+    fn parse_relation_value( walker : &mut CursorWalker, source : &String ) -> RelationValue {
+        let mut node = walker.next().unwrap();
+        let kind = node.kind();
+        match kind {
+            "column" => RelationValue::COL( NodeFuncs::as_string( &node, source )),
+            "function_call" => RelationValue::FUNC(NodeFuncs::as_string( &node, source)),
+            "(" => {
+                let mut values: Vec<RelationValue> = Vec::new();
+                let mut node = walker.next().unwrap();
+                while !node.kind().eq(")") {
+                    values.push(CassandraParser::parse_relation_value(walker, source));
+                    node = walker.next().unwrap();
+                }
+                RelationValue::LIST(values)
+            },
+            _ => RelationValue::CONST( NodeFuncs::as_string( &node, source) ),
         }
     }
 
-    fn parse_order_by( node : &Node, source : &String ) -> OrderClause {
-        OrderClause {
-            name: node.child(2).unwrap().utf8_text(source.as_bytes()),
-            desc: node.child_count()> 3 &&
-                node.child(3).unwrap().utf8_text(source.as_bytes()).eq("DESC"),
-        }
+    // walker on "order-spec"
+    fn parse_order_by( walker : &mut CursorWalker, source : &String ) -> Option<OrderClause> {
+        // consumer "order"
+        walker.next();
+        // consumer "by"
+        walker.next();
+        Some(OrderClause {
+            name: NodeFuncs::as_string( &walker.next().unwrap(),source ),
+            desc: {
+                let p = walker.peek();
+                if p.is_some() && p.unwrap().kind().eq("order_direction") {
+                    // consumer order direction
+                    walker.next();
+                    walker.next().unwrap().kind().eq("DESC")
+                } else {
+                    false
+                }
+            },
+        })
     }
 
-    fn parse_select_element( node : &Node, source : &String )  -> Element {
+    /// walker on "select_element"
+    fn parse_select_element( walker : &mut CursorWalker, source : &String )  -> SelectElement {
 
-        let mut alias :Option<String> = None;
-        let type_ = node.child(0).unwrap();
-        let is_column = type_.kind().eq("column");
-        if node.child_count() > 2 {
-            if type_.kind().eq("column") || type_.kind().eq("function_call") {
-                alias = Some( node.child(2).unwrap().utf8_text( source.as_bytes() ).unwrap().to_string() );
+        let type_ = walker.next().unwrap();
+        match type_.kind() {
+            "column" => {
+                if walker.peek().unwrap().kind().eq("AS") {
+                    // consume the "AS"
+                    walker.next();
+                    SelectElement::COLUMN(
+                        Named {
+                         name : NodeFuncs::as_string( &type_, source ),
+                         alias : Some(NodeFuncs::as_string( &walker.next().unwrap(), source )),
+                        }
+                    )
+                } else {
+                    SelectElement::COLUMN (
+                        Named {
+                            name: NodeFuncs::as_string(&type_, source),
+                            alias: None,
+                        }
+                    )
+                }
             }
-        }
-        if type_.kind().eq("column") {
-            Element::COLUMN {
-                name: type_.utf8_text(source.as_bytes()).unwrap().to_string(),
-                alias: alias,
-            }
-        } else if type_.kind().eq("function_call") {
-            Element::FUNCTION {
-                name: type_.utf8_text(source.as_bytes()).unwrap().to_string(),
-                alias: alias,
-            }
-        } else if type_kind().eq("*") {
-            Element::STAR
-        } else {
-            Element::DOT_STAR( type_.utf8_text(source.as_bytes()).unwrap().to_string() )
+            "function_call" => {
+                let mut sibling = type_.next_sibling();
+                if sibling.is_some() && sibling.unwrap().kind().eq("AS") {
+                    // move walker to sibling position
+                    while walker.next().unwrap().id() != sibling.unwrap().id() {
+                    }
+                    SelectElement::FUNCTION(
+                        Named {
+                            name: NodeFuncs::as_string(&type_, source),
+                            alias: Some(NodeFuncs::as_string(&walker.next().unwrap(), source)),
+                        })
+                } else {
+                    SelectElement::FUNCTION(
+                        Named {
+                        name: NodeFuncs::as_string( &type_,source),
+                        alias: None,
+                    })
+                }
+            },
+            "*" => SelectElement::STAR,
+            _ => {
+                // consume the "."
+                walker.next();
+                // consume the  "*"
+                walker.next();
+                SelectElement::DOT_STAR( NodeFuncs::as_string(&type_, source ))
+            },
         }
     }
 }
 
+impl ToString for CassandraStatement {
+    fn to_string(&self) -> String {
+        // TODO remove this
+        let unimplemented = String::from("Unimplemented");
+        match self {
+            CassandraStatement::AlterKeyspace => unimplemented,
+            CassandraStatement::AlterMaterializedView => unimplemented,
+            CassandraStatement::AlterRole => unimplemented,
+            CassandraStatement::AlterTable => unimplemented,
+            CassandraStatement::AlterType => unimplemented,
+            CassandraStatement::AlterUser => unimplemented,
+            CassandraStatement::ApplyBatch => String::from( "APPLY BATCH"),
+            CassandraStatement::CreateAggregate => unimplemented,
+            CassandraStatement::CreateFunction => unimplemented,
+            CassandraStatement::CreateIndex => unimplemented,
+            CassandraStatement::CreateKeyspace => unimplemented,
+            CassandraStatement::CreateMaterializedView => unimplemented,
+            CassandraStatement::CreateRole => unimplemented,
+            CassandraStatement::CreateTable => unimplemented,
+            CassandraStatement::CreateTrigger => unimplemented,
+            CassandraStatement::CreateType => unimplemented,
+            CassandraStatement::CreateUser => unimplemented,
+            CassandraStatement::DeleteStatement => unimplemented,
+            CassandraStatement::DropAggregate => unimplemented,
+            CassandraStatement::DropFunction => unimplemented,
+            CassandraStatement::DropIndex => unimplemented,
+            CassandraStatement::DropKeyspace => unimplemented,
+            CassandraStatement::DropMaterializedView => unimplemented,
+            CassandraStatement::DropRole => unimplemented,
+            CassandraStatement::DropTable => unimplemented,
+            CassandraStatement::DropTrigger => unimplemented,
+            CassandraStatement::DropType => unimplemented,
+            CassandraStatement::DropUser => unimplemented,
+            CassandraStatement::Grant => unimplemented,
+            CassandraStatement::InsertStatement(statement_data) => statement_data.to_string(),
+            CassandraStatement::ListPermissions => unimplemented,
+            CassandraStatement::ListRoles => unimplemented,
+            CassandraStatement::Revoke => unimplemented,
+            CassandraStatement::SelectStatement(statement_data) => statement_data.to_string(),
+            CassandraStatement::Truncate(table) => format!( "TRUNCATE TABLE {}", table ).to_string(),
+            CassandraStatement::Update => unimplemented,
+            CassandraStatement::UseStatement(keyspace) => format!("USE {}",keyspace).to_string(),
+            CassandraStatement::UNKNOWN(_) => unimplemented,
+        }
+    }
+}
 pub struct CassandraAST {
     /// The query string
     text: String,
     /// the tree-sitter tree
     pub(crate) tree: Tree,
     /// the statement type of the query
-    pub statement_type: CassandraASTStatementType,
+    pub statement: CassandraStatement,
     /// The default keyspace if set.  Used when keyspace not specified in query.
     default_keyspace: Option<String>,
 }
@@ -291,10 +1068,10 @@ impl CassandraAST {
         let tree = parser.parse(&cassandra_statement, None).unwrap();
 
         CassandraAST {
-            statement_type: if tree.root_node().has_error() {
-                CassandraASTStatementType::UNKNOWN(cassandra_statement.clone())
+            statement: if tree.root_node().has_error() {
+                CassandraStatement::UNKNOWN(cassandra_statement.clone())
             } else {
-                CassandraAST::extract_statement_type(&tree, &cassandra_statement)
+                CassandraAST::extract_statement(&tree, &cassandra_statement)
             },
             default_keyspace: None,
             text: cassandra_statement,
@@ -366,6 +1143,7 @@ impl CassandraAST {
         }
         nodes
     }
+
 
     /// Retrieves all the nodes that match the end of the path starting at the specified node.
     ///
@@ -564,12 +1342,12 @@ impl CassandraAST {
     /// * `tree` the tree to extract the statement type from.
     ///
     /// returns a `CassandraASTStatementType` for the statement.
-    pub fn extract_statement_type(tree: &Tree, source : &String ) -> CassandraASTStatementType {
+    pub fn extract_statement(tree: &Tree, source : &String ) -> CassandraStatement {
         let mut node = tree.root_node();
         if node.kind().eq("source_file") {
             node = node.child(0).unwrap();
         }
-        CassandraASTStatementType::from_node(&node, source)
+        CassandraStatement::from_node(&node, source)
     }
 }
 
@@ -577,21 +1355,33 @@ struct CursorWalker<'a> {
     cursor : TreeCursor<'a>,
     id : usize,
     next : Option<Node<'a>>,
+    next_kind : String,
+    last : Option<Node<'a>>,
 }
 
 impl <'a> CursorWalker<'a> {
     fn new(cursor : TreeCursor<'a>) -> CursorWalker<'a> {
         CursorWalker {
             id : cursor.node().id(),
+            next_kind : cursor.node().kind().to_string(),
             next : Some(cursor.node()),
+            last : None,
             cursor,
         }
     }
 
+    fn peek(&mut self) -> Option<Node<'a>> {
+        self.next
+    }
+
+    fn current(&self) -> Option<Node<'a>> {
+        self.last
+    }
+
     fn next(&mut self) -> Option<Node<'a>> {
-        let result = self.next;
+        self.last = self.next;
         self.next = None;
-        if result.is_some() {
+        if self.last.is_some() {
             if self.cursor.goto_first_child() {
                 self.next = Some(self.cursor.node());
             } else if self.cursor.goto_next_sibling() {
@@ -611,7 +1401,11 @@ impl <'a> CursorWalker<'a> {
             }
 
         }
-        result
+        match self.next {
+            Some(x) => self.next_kind = x.kind().to_string(),
+            None => self.next_kind = String::new(),
+        }
+        self.last
     }
 }
 
@@ -662,8 +1456,9 @@ impl SearchPattern {
 
 #[cfg(test)]
 mod tests {
+    use sqlparser::test_utils::table;
     use tree_sitter::Node;
-    use crate::transforms::cassandra::cassandra_ast::{CassandraAST, CassandraASTStatementType};
+    use crate::transforms::cassandra::cassandra_ast::{CassandraAST, CassandraStatement, RelationOperator, RelationValue, SelectElement};
 
     #[test]
     fn test_get_table_name() {
@@ -675,6 +1470,62 @@ mod tests {
     }
 
     #[test]
+    fn test_get_statement_type2() {
+        let stmt =  "SELECT column FROM table WHERE col = $$ a code's block $$;";
+        let ast = CassandraAST::new(stmt.to_string());
+        let foo = ast.statement;
+        let foo_str = foo.to_string();
+        assert_eq!( "SELECT column FROM table WHERE col = $$ a code's block $$", foo_str );
+        print!( "{:?}", foo );
+        match foo {
+            CassandraStatement::SelectStatement(statement_data) =>
+                {
+                    assert!( ! statement_data.modifiers.json );
+                    assert!( ! statement_data.modifiers.filtering );
+                    assert_eq!( None, statement_data.modifiers.limit);
+                    assert!( ! statement_data.modifiers.distinct);
+
+                    assert_eq!( "table", statement_data.table_name.as_str() );
+
+                    let mut element = statement_data.elements.get(0);
+                    match element {
+                        Some(SelectElement::COLUMN(named)) => {
+                            assert_eq!( "column", named.name);
+                            assert_eq!( None, named.alias );
+                        },
+                        _ => assert!( false ),
+                    };
+
+                    let mut relation = statement_data.where_clause.get(0);
+                    match &relation {
+                        Some(relation_element) => {
+                            match &relation_element.obj {
+                                RelationValue::COL(name) => {
+                                    assert_eq!( "col", name );
+                                },
+                                _ => assert!(false),
+                            };
+                            match &relation_element.oper {
+                                RelationOperator::EQ => assert!(true),
+                                _ => assert!(false),
+                            };
+                            match &relation_element.value {
+                                RelationValue::CONST(value) => {
+                                    assert_eq!("$$ a code's block $$", value );
+                                },
+                                _ => assert!(false),
+                            };
+                        },
+                        _ => assert!(false),
+                    }
+                    assert_ne!( None, element );
+
+                },
+            _ => assert!( false ),
+        }
+    }
+
+        #[test]
     fn test_get_statement_type() {
         let stmts = [
             "ALTER KEYSPACE keyspace WITH REPLICATION = { 'foo' : 'bar', 'baz' : 5};",
@@ -706,59 +1557,59 @@ mod tests {
             "DROP TYPE IF EXISTS keyspace.type ;",
             "DROP USER if exists user_name;",
             "GRANT ALL ON 'keyspace'.table TO role;",
-            "INSERT INTO table (col1, col2) VALUES (( 5, 6 ), 'foo');",
+            //"INSERT INTO table (col1, col2) VALUES (( 5, 6 ), 'foo');",
             "LIST ALL;",
             "LIST ROLES;",
             "REVOKE ALL ON ALL ROLES FROM role;",
-            "SELECT column FROM table WHERE col = $$ a code's block $$;",
-            "TRUNCATE keyspace.table;",
+            //"SELECT column FROM table WHERE col = $$ a code's block $$;",
+            //"TRUNCATE keyspace.table;",
             "UPDATE keyspace.table USING TIMESTAMP 3 SET col1 = 'foo' WHERE col2=5;",
-            "USE key_name;",
+            //"USE key_name;",
             "Not a valid statement"];
         let types = [
-            CassandraASTStatementType::AlterKeyspace,
-            CassandraASTStatementType::AlterMaterializedView,
-            CassandraASTStatementType::AlterRole,
-            CassandraASTStatementType::AlterTable,
-            CassandraASTStatementType::AlterType,
-            CassandraASTStatementType::AlterUser,
-            CassandraASTStatementType::ApplyBatch,
-            CassandraASTStatementType::CreateAggregate,
-            CassandraASTStatementType::CreateFunction,
-            CassandraASTStatementType::CreateIndex,
-            CassandraASTStatementType::CreateKeyspace,
-            CassandraASTStatementType::CreateMaterializedView,
-            CassandraASTStatementType::CreateRole,
-            CassandraASTStatementType::CreateTable,
-            CassandraASTStatementType::CreateTrigger,
-            CassandraASTStatementType::CreateType,
-            CassandraASTStatementType::CreateUser,
-            CassandraASTStatementType::DeleteStatement,
-            CassandraASTStatementType::DropAggregate,
-            CassandraASTStatementType::DropFunction,
-            CassandraASTStatementType::DropIndex,
-            CassandraASTStatementType::DropKeyspace,
-            CassandraASTStatementType::DropMaterializedView,
-            CassandraASTStatementType::DropRole,
-            CassandraASTStatementType::DropTable,
-            CassandraASTStatementType::DropTrigger,
-            CassandraASTStatementType::DropType,
-            CassandraASTStatementType::DropUser,
-            CassandraASTStatementType::Grant,
-            CassandraASTStatementType::InsertStatement,
-            CassandraASTStatementType::ListPermissions,
-            CassandraASTStatementType::ListRoles,
-            CassandraASTStatementType::Revoke,
-            CassandraASTStatementType::SelectStatement,
-            CassandraASTStatementType::Truncate,
-            CassandraASTStatementType::Update,
-            CassandraASTStatementType::UseStatement,
-            CassandraASTStatementType::UNKNOWN("Not a valid statement".to_string()),
+            CassandraStatement::AlterKeyspace,
+            CassandraStatement::AlterMaterializedView,
+            CassandraStatement::AlterRole,
+            CassandraStatement::AlterTable,
+            CassandraStatement::AlterType,
+            CassandraStatement::AlterUser,
+            CassandraStatement::ApplyBatch,
+            CassandraStatement::CreateAggregate,
+            CassandraStatement::CreateFunction,
+            CassandraStatement::CreateIndex,
+            CassandraStatement::CreateKeyspace,
+            CassandraStatement::CreateMaterializedView,
+            CassandraStatement::CreateRole,
+            CassandraStatement::CreateTable,
+            CassandraStatement::CreateTrigger,
+            CassandraStatement::CreateType,
+            CassandraStatement::CreateUser,
+            CassandraStatement::DeleteStatement,
+            CassandraStatement::DropAggregate,
+            CassandraStatement::DropFunction,
+            CassandraStatement::DropIndex,
+            CassandraStatement::DropKeyspace,
+            CassandraStatement::DropMaterializedView,
+            CassandraStatement::DropRole,
+            CassandraStatement::DropTable,
+            CassandraStatement::DropTrigger,
+            CassandraStatement::DropType,
+            CassandraStatement::DropUser,
+            CassandraStatement::Grant,
+            //CassandraStatement::InsertStatement,
+            CassandraStatement::ListPermissions,
+            CassandraStatement::ListRoles,
+            CassandraStatement::Revoke,
+            //CassandraStatement::SelectStatement(data),
+            //CassandraStatement::Truncate,
+            CassandraStatement::Update,
+            //CassandraStatement::UseStatement(keyspace),
+            CassandraStatement::UNKNOWN("Not a valid statement".to_string()),
         ];
 
         for i in 0..stmts.len() {
             let ast = CassandraAST::new(stmts.get(i).unwrap().to_string());
-            assert_eq!(*types.get(i).unwrap(), ast.statement_type);
+            assert_eq!(*types.get(i).unwrap(), ast.statement);
         }
     }
 
@@ -826,8 +1677,6 @@ mod tests {
         assert!(!ast.contains( |_| {return false;} ));
         let selector = |n:&Node| n.kind().eq( "AS");
         assert!(ast.contains( selector ));
-
-
     }
 
     #[test]
@@ -850,5 +1699,30 @@ mod tests {
         let result =ast.search( "constant" );
         assert_eq!( 1, result.len() );
         assert_eq!( "6", ast.node_text( result.get(0).unwrap() ));
+    }
+
+    #[test]
+    fn test_truncate() {
+        let ast = CassandraAST::new("TRUNCATE TABLE foo".to_string());
+        match ast.statement {
+            CassandraStatement::Truncate(table) => assert_eq!("foo", table),
+            _ => assert!(false),
+        }
+        let ast = CassandraAST::new("TRUNCATE foo".to_string());
+        match ast.statement {
+            CassandraStatement::Truncate(table) => assert_eq!("foo", table),
+            _ => assert!(false),
+        }
+
+        let ast = CassandraAST::new("TRUNCATE TABLE foo.bar".to_string());
+        match ast.statement {
+            CassandraStatement::Truncate(table) => assert_eq!("foo.bar", table),
+            _ => assert!(false),
+        }
+        let ast = CassandraAST::new("TRUNCATE foo.bar".to_string());
+        match ast.statement {
+            CassandraStatement::Truncate(table) => assert_eq!("foo.bar", table),
+            _ => assert!(false),
+        }
     }
 }
