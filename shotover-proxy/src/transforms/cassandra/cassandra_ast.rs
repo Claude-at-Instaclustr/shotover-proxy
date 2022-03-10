@@ -249,30 +249,6 @@ impl ToString for InsertExpression {
     }
 }
 
-
-
-/*
-        assignment_map : $ => seq("{", commaSep1( seq( $.constant, ":", $.constant)),"}"),
-        assignment_set : $ => seq("{", optional( commaSep1( $.constant ) ),"}"),
-        assignment_list : $  => seq( "[", commaSep1( $.constant ), "]"),
-
-        assignment_tuple : $ =>
-            seq(
-                "(",
-                $.constant,
-                choice(
-                    repeat( seq( ",", $.constant)),
-                    repeat( seq( ",", $.assignment_tuple)),
-                    commaSep1( $.assignment_tuple ),
-                ),
-                ")",
-            ),
-
-        assignment_map : $ => seq("{", commaSep1( seq( $.constant, ":", $.constant)),"}"),
-        assignment_set : $ => seq("{", optional( commaSep1( $.constant ) ),"}"),
-        assignment_list : $  => seq( "[", commaSep1( $.constant ), "]"),
-*/
-
 #[derive(PartialEq, Debug, Clone)]
 pub struct SelectStatementData {
     pub modifiers : StatementModifiers,
@@ -483,9 +459,21 @@ impl NodeFuncs {
     }
 }
 impl CassandraStatement {
+
+    pub fn from_tree(tree: &Tree, source : &String ) -> CassandraStatement {
+        let mut node = tree.root_node();
+        if node.kind().eq("source_file") {
+            node = node.child(0).unwrap();
+        }
+        CassandraStatement::from_node( &node, source )
+    }
+
     pub fn from_node(node: &Node, source: &String) -> CassandraStatement {
-        let kind = node.kind();
-        match kind {
+
+        if node.has_error() {
+            return CassandraStatement::UNKNOWN(source.clone());
+        }
+        match node.kind() {
             "alter_keyspace" => CassandraStatement::AlterKeyspace,
             "alter_materialized_view" => CassandraStatement::AlterMaterializedView,
             "alter_role" => CassandraStatement::AlterRole,
@@ -1171,8 +1159,6 @@ pub struct CassandraAST {
     pub(crate) tree: Tree,
     /// the statement type of the query
     pub statement: CassandraStatement,
-    /// The default keyspace if set.  Used when keyspace not specified in query.
-    default_keyspace: Option<String>,
 }
 
 impl CassandraAST {
@@ -1194,12 +1180,7 @@ impl CassandraAST {
         let tree = parser.parse(&cassandra_statement, None).unwrap();
 
         CassandraAST {
-            statement: if tree.root_node().has_error() {
-                CassandraStatement::UNKNOWN(cassandra_statement.clone())
-            } else {
-                CassandraAST::extract_statement(&tree, &cassandra_statement)
-            },
-            default_keyspace: None,
+            statement: CassandraStatement::from_tree( &tree, &cassandra_statement ),
             text: cassandra_statement,
             tree,
         }
@@ -1214,332 +1195,7 @@ impl CassandraAST {
     pub fn node_text(&self, node: &Node) -> String {
         node.utf8_text(&self.text.as_bytes()).unwrap().to_string()
     }
-/*
-    ///
-    /// Gets the fully qualified table name specified in the query.
-    ///
-    /// Returns an empty string if no table name is specified.
-    ///
-    ///  * `default_keyspace` is the defined default keyspace for the execution context.
-    /// If the query does not specify a keyspace for the table this one will be prepended.
-    /// If it is `None` then the "naked" table name is returned.
-    pub fn get_table_name(&self, default_keyspace: &Option<String>) -> String {
-        let nodes = self.search("table_name");
-        match nodes.first() {
-            None => "".to_string(),
-            Some(node) => {
-                let candidate_name = self.node_text(node);
-                if candidate_name.contains(".") {
-                    candidate_name.to_string()
-                } else {
-                    match default_keyspace {
-                        None => candidate_name,
-                        Some(keyspace) => format!("{}.{}", keyspace, candidate_name),
-                    }
-                }
-            }
-        }
-    }
-    */
-
-/*
-    /// Retrieves all the nodes that match the end of the path.
-    ///
-    /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
-    ///
-    /// returns a vector of matching nodes.
-    ///
-    pub fn search<'a>(&'a self, path: &'static str) -> Box<Vec<Node<'a>>> {
-        CassandraAST::search_cursor(self.tree.walk(), path)
-    }
-
-    /// Retrieves all the nodes that match the end of the path starting at the specified node.
-    ///
-    /// * `node` The node to start searching from.
-    /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
-    ///
-    /// returns a vector of matching nodes.
-    pub fn search_node<'a>(node: &'a Node, path: &'static str) -> Box<Vec<Node<'a>>> {
-        let mut nodes = Box::new(vec![*node]);
-        for segment in path.split('/').map(|tok| tok.trim()) {
-            let mut found_nodes = Box::new(Vec::new());
-            let pattern = SearchPattern::from_str(segment);
-            for node in nodes.iter() {
-                CassandraAST::_find(&mut found_nodes, &mut node.walk(), &pattern);
-            }
-            nodes = found_nodes;
-        }
-        nodes
-    }
-
-
-    /// Retrieves all the nodes that match the end of the path starting at the specified node.
-    ///
-    /// * `node` The node to start searching from.
-    /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
-    ///
-    /// returns a vector of matching nodes.
-    pub fn search_cursor<'a>(cursor : TreeCursor<'a>, path: &'static str) -> Box<Vec<Node<'a>>> {
-        let mut nodes = Box::new(vec![cursor.node()]);
-        for segment in path.split('/').map(|tok| tok.trim()) {
-            let mut found_nodes = Box::new(Vec::new());
-            let pattern = SearchPattern::from_str(segment);
-            for node in nodes.iter() {
-                CassandraAST::_find(&mut found_nodes, &mut node.walk(), &pattern);
-            }
-            nodes = found_nodes;
-        }
-        nodes
-    }
-
-    // performs a recursive search in the tree
-    fn _find<'a>(
-        nodes: & mut Vec<Node<'a>>,
-        cursor: & mut TreeCursor<'a>,
-        pattern: &SearchPattern,
-    ) {
-        let node = cursor.node();
-        if pattern.name.is_match(node.kind()) {
-            match &pattern.child {
-                None => nodes.push(node),
-                Some(child) => {
-                    if CassandraAST::_has(cursor, child) {
-                        nodes.push(node);
-                    }
-                }
-            }
-        } else {
-            if cursor.goto_first_child() {
-                CassandraAST::_find(nodes, cursor, pattern);
-                while cursor.goto_next_sibling() {
-                    CassandraAST::_find(nodes, cursor, pattern);
-                }
-                cursor.goto_parent();
-            }
-        }
-    }
-
-    /// checks if a node has a specific child node
-    fn _has(cursor: &mut TreeCursor, name: &Regex) -> bool {
-        if cursor.goto_first_child() {
-            if name.is_match(cursor.node().kind()) || CassandraAST::_has(cursor, name) {
-                cursor.goto_parent();
-                return true;
-            }
-            while cursor.goto_next_sibling() {
-                if name.is_match(cursor.node().kind()) || CassandraAST::_has(cursor, name) {
-                    cursor.goto_parent();
-                    return true;
-                }
-            }
-        }
-        cursor.goto_parent();
-        false
-    }
-
-    /// Determines if any node matches the end of the path.
-    ///
-    /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
-    ///
-    /// returns `true` if there is at least one matching node, `false` otherwise
-    pub fn has(&self, path: &'static str) -> bool {
-        return !self.search(path).is_empty();
-    }
-
-    /// Determines if the specified node has a match for the end of the path.
-    ///
-    /// * `node` The node to start searching from.
-    /// * `path` the path to search for.  see `SearchPattern` for explanation of path structure.
-    ///
-    /// returns `true` if there is at least one matching node, `false` otherwise
-    pub fn has_node(node: &Node, path: &'static str) -> bool {
-        return !CassandraAST::search_node(node, path).is_empty();
-    }
-
-    /// extracts the nodes that match the selector
-    ///
-    /// * node the node to start searching from
-    /// * selector a `fn(Node)` that returns true for matching elements.
-    ///
-    /// returns `true` if there is at least one matching node, `false` otherwise
-    pub fn extract_node(node: Node, selector: fn(Node) -> bool) -> Vec<Node> {
-        let mut result: Vec<Node> = vec![];
-        CassandraAST::_extract_cursor(&mut node.walk(), selector, &mut result);
-        result
-    }
-
-    fn _extract_cursor<'a>(
-        cursor: &mut TreeCursor<'a>,
-        selector: fn(Node) -> bool,
-        result: &mut Vec<Node<'a>>,
-    ) {
-        if selector(cursor.node()) {
-            result.push(cursor.node());
-        }
-        if cursor.goto_first_child() {
-            CassandraAST::_extract_cursor(cursor, selector, result);
-            while cursor.goto_next_sibling() {
-                CassandraAST::_extract_cursor(cursor, selector, result);
-            }
-            cursor.goto_parent();
-        }
-    }
-
-    /// extracts the nodes that match the selector
-    ///
-    /// * selector a `fn(Node)` that returns true for matching elements.
-    ///
-    /// returns `true` if there is at least one matching node, `false` otherwise
-    pub fn extract(&self, f: fn(Node) -> bool) -> Vec<Node> {
-        CassandraAST::extract_node(self.tree.root_node(), f)
-    }
-    /*
-        pub fn apply<F>(&'tree self, selector : fn(Node)->bool, mut action : F ) where
-            F : FnMut(Node)  + Copy,
-        {
-            CassandraAST::apply_node(self.tree.root_node(), selector, action );
-        }
-
-        pub fn apply_node<F>(node : Node, selector : fn(Node) ->bool, mut action : F ) where
-            F : FnMut(Node)  + Copy,
-        {
-            CassandraAST::apply_cursor(&mut node.walk(), selector,  action);
-        }
-
-        pub fn apply_cursor<F>(cursor : &mut TreeCursor, selector : fn(Node) ->bool, mut action : F ) where
-            F : FnMut(Node),
-        {
-            if selector( cursor.node() ) {
-                action(cursor.node());
-            }
-            if cursor.goto_first_child() {
-                CassandraAST::apply_cursor(cursor, selector, action );
-                while cursor.goto_next_sibling() {
-                    CassandraAST::apply_cursor(cursor, selector, action );
-                }
-                cursor.goto_parent();
-            }
-        }
-    */
-
-    ///  determines if any node in the tree matches the selector.
-    ///
-    /// * selector a `fn(Node)` that returns true for matching elements.
-    ///
-    /// Returns `true` if there is a match, `false` otherwise.
-    pub fn contains<F: Fn(&Node)->bool>(&self, selector: F) -> bool
-    {
-        CassandraAST::contains_node(&self.tree.root_node(), selector)
-    }
-
-    ///  determines if any node from the provided node down matches the selector.
-    ///
-    /// * node the node of the current position.
-    /// * selector a `fn(Node)` that returns true for matching elements.
-    ///
-    /// Returns `true` if there is a match, `false` otherwise.
-    pub fn contains_node<F: Fn(&Node)->bool>(node: &Node, selector: F ) -> bool
-    {
-        CassandraAST::contains_cursor(node.walk(), selector)
-    }
-
-    ///  determines if any node from the cursor position down matches the selector.
-    ///
-    /// * cursor A cursor of the current position.
-    /// * selector a `fn(Node)` that returns true for matching elements.
-    ///
-    /// Returns `true` if there is a match, `false` otherwise.
-    pub fn contains_cursor<F: Fn(&Node)->bool>( cursor: TreeCursor,  selector: F) -> bool
-    {
-        let mut walker = CursorWalker::new( cursor );
-        let mut next = walker.next();
-        while next.is_some() {
-            let n = next.unwrap();
-            let k = n.kind();
-            let i = n.id();
-            if selector(&n) {
-                return true;
-            }
-            next = walker.next();
-        }
-        false
-    }
-*/
-    /// Determines the statement type from the tree
-    ///
-    /// * `tree` the tree to extract the statement type from.
-    ///
-    /// returns a `CassandraASTStatementType` for the statement.
-    pub fn extract_statement(tree: &Tree, source : &String ) -> CassandraStatement {
-        let mut node = tree.root_node();
-        if node.kind().eq("source_file") {
-            node = node.child(0).unwrap();
-        }
-        CassandraStatement::from_node(&node, source)
-    }
-
-
 }
-
-/*
-struct CursorWalker<'a> {
-    cursor : TreeCursor<'a>,
-    id : usize,
-    next : Option<Node<'a>>,
-    next_kind : String,
-    last : Option<Node<'a>>,
-}
-
-impl <'a> CursorWalker<'a> {
-    fn new(cursor : TreeCursor<'a>) -> CursorWalker<'a> {
-        CursorWalker {
-            id : cursor.node().id(),
-            next_kind : cursor.node().kind().to_string(),
-            next : Some(cursor.node()),
-            last : None,
-            cursor,
-        }
-    }
-
-    fn peek(&mut self) -> Option<Node<'a>> {
-        self.next
-    }
-
-    fn current(&self) -> Option<Node<'a>> {
-        self.last
-    }
-
-    fn next(&mut self) -> Option<Node<'a>> {
-        self.last = self.next;
-        self.next = None;
-        if self.last.is_some() {
-            if self.cursor.goto_first_child() {
-                self.next = Some(self.cursor.node());
-            } else if self.cursor.goto_next_sibling() {
-                self.next = Some(self.cursor.node());
-            }
-            let mut scanning = self.cursor.node().id() != self.id;
-            while scanning && self.next.is_none() {
-                self.cursor.goto_parent();
-                if self.cursor.node().id() == self.id {
-                    scanning = false;
-                    self.next = None;
-                }
-                if scanning && self.cursor.goto_next_sibling() {
-                    self.next = Some( self.cursor.node());
-                    scanning = false;
-                }
-            }
-
-        }
-        match self.next {
-            Some(x) => self.next_kind = x.kind().to_string(),
-            None => self.next_kind = String::new(),
-        }
-        self.last
-    }
-}
-*/
 
 /// The SearchPattern object used for string pattern matching
 pub struct SearchPattern {
@@ -1591,16 +1247,6 @@ mod tests {
     use tree_sitter::Node;
     use crate::transforms::cassandra::cassandra_ast::{CassandraAST, CassandraStatement, RelationOperator, RelationValue, SelectElement};
 
-    /*
-    #[test]
-    fn test_get_table_name() {
-        let ast = CassandraAST::new("SELECT foo from bar.baz where fu='something'".to_string());
-        let keyspace: Option<String> = None;
-        assert_eq!("bar.baz", ast.get_table_name(&keyspace));
-        let ast = CassandraAST::new("Use keyspace'".to_string());
-        assert_eq!("", ast.get_table_name(&keyspace));
-    }
-*/
     #[test]
     fn test_select() {
         let stmt =  "SELECT column FROM table WHERE col = $$ a code's block $$;";
@@ -1753,87 +1399,6 @@ mod tests {
         assert!(ast.has_error());
     }
 
-    /*
-    #[test]
-    fn test_search() {
-        let ast = CassandraAST::new("SELECT column AS column2, func(*) AS func2, col3 FROM table where col3 = 6".to_string());
-        // the above will produce the following tree
-        // (source_file (select_statement (select_elements (select_element) (select_element (function_call)) (select_element)) (from_spec (table_name)) (where_spec (relation_elements (relation_element (constant))))))
-
-        let expected = ["column AS column2",
-            "func(*) AS func2",
-            "col3"];
-        let result = ast.search(" select_element ");
-
-        for i in 0..result.len() {
-            assert_eq!(expected.get(i).unwrap().to_string(), ast.node_text(result.get(i).unwrap()));
-        }
-
-        let expected = ["column", "col3"];
-        let result = ast.search(" select_element / column ");
-
-        for i in 0..result.len() {
-            assert_eq!(expected.get(i).unwrap().to_string(), ast.node_text(result.get(i).unwrap()));
-        }
-
-        let expected = ["column2"];
-        let result = ast.search(" select_element[column] / alias ");
-
-        for i in 0..result.len() {
-            assert_eq!(expected.get(i).unwrap().to_string(), ast.node_text(result.get(i).unwrap()));
-        }
-
-        let expected = ["column AS column2", "func(*) AS func2"];
-        let result = ast.search(" select_element[alias] ");
-
-        for i in 0..result.len() {
-            assert_eq!(expected.get(i).unwrap().to_string(), ast.node_text(result.get(i).unwrap()));
-        }
-    }
-
-    #[test]
-    fn test_has() {
-        let ast = CassandraAST::new("SELECT column AS column2, func(*) AS func2, col3 FROM table where col3 = 6".to_string());
-        // the above will produce the following tree
-        // (source_file (select_statement (select_elements (select_element) (select_element (function_call)) (select_element)) (from_spec (table_name)) (where_spec (relation_elements (relation_element (constant))))))
-        assert!(ast.has("select_element"));
-        assert!(!ast.has("expression_list"));
-    }
-
-    #[test]
-    fn test_contains() {
-        let ast = CassandraAST::new("SELECT column AS column2, func(*) AS func2, col3 FROM table where col3 = 6".to_string());
-        // the above will produce the following tree
-        // (source_file (select_statement (select_elements (select_element) (select_element (function_call)) (select_element)) (from_spec (table_name)) (where_spec (relation_elements (relation_element (constant))))))
-        let selector = |n:&Node| n.is_named();
-        assert!(ast.contains( selector ));
-        assert!(!ast.contains( |_| {return false;} ));
-        let selector = |n:&Node| n.kind().eq( "AS");
-        assert!(ast.contains( selector ));
-    }
-
-    #[test]
-    fn test_extract() {
-        let ast = CassandraAST::new("SELECT column AS column2, func(*) AS func2, col3 FROM table where col3 = 6".to_string());
-        // the above will produce the following tree
-        // (source_file (select_statement (select_elements (select_element) (select_element (function_call)) (select_element)) (from_spec (table_name)) (where_spec (relation_elements (relation_element (constant))))))
-        let result =ast.extract( |n:Node| n.kind().eq( "AS") );
-        assert_eq!( 2, result.len() );
-        let result = ast.extract( |_|{ return false; } );
-        assert!( result.is_empty() );
-    }
-
-    #[test]
-    fn test_node_text() {
-        let ast = CassandraAST::new("SELECT column AS column2, func(*) AS func2, col3 FROM table where col3 = 6".to_string());
-        // the above will produce the following tree
-        // (source_file (select_statement (select_elements (select_element) (select_element (function_call)) (select_element)) (from_spec (table_name)) (where_spec (relation_elements (relation_element (constant))))))
-
-        let result =ast.search( "constant" );
-        assert_eq!( 1, result.len() );
-        assert_eq!( "6", ast.node_text( result.get(0).unwrap() ));
-    }
-*/
     #[test]
     fn test_truncate() {
         let ast = CassandraAST::new("TRUNCATE TABLE foo".to_string());
