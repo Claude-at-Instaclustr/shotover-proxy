@@ -254,7 +254,7 @@ pub struct SelectStatementData {
     pub modifiers : StatementModifiers,
     pub table_name: String,
     pub elements : Vec<SelectElement>,
-    pub where_clause : Vec<RelationElement>,
+    pub where_clause : Option<Vec<RelationElement>>,
     pub order : Option<OrderClause>,
 }
 
@@ -282,12 +282,17 @@ impl SelectStatementData {
             _ => None
         }).filter( |e| e.is_some()).map(|e| e.unwrap()).collect()
     }
-    /// return the column names selected
+    /// return the column names from the where clause
     pub fn where_columns(&self ) -> Vec<String> {
-        self.where_clause.iter().map( |e| match &e.obj {
-            COL(name) => Some(name.clone()),
-            _ => None,
-        }).filter( |e| e.is_some()).map( |e| e.unwrap()).collect()
+        match &self.where_clause {
+            Some(x) => {
+                x.iter().map(|e| match &e.obj {
+                    COL(name) => Some(name.clone()),
+                    _ => None,
+                }).filter(|e| e.is_some()).map(|e| e.unwrap()).collect()
+            },
+            None => vec!()
+        }
     }
 }
 
@@ -301,11 +306,13 @@ impl ToString for SelectStatementData {
         if self.modifiers.json {
             result.push_str( "JSON ");
         }
-        result.push_str( self.elements.iter().map( |e| e.to_string() ).join(",").as_str() );
+        result.push_str( self.elements.iter().map( |e| e.to_string() ).join(", ").as_str() );
         result.push_str( " FROM ");
         result.push_str( self.table_name.as_str() );
-        result.push_str( " WHERE ");
-        result.push_str( self.where_clause.iter().map( |w| w.to_string() ).join(" AND ").as_str());
+        if self.where_clause.is_some() {
+            result.push_str( " WHERE ");
+            result.push_str(self.where_clause.as_ref().unwrap().iter().map(|w| w.to_string()).join(" AND ").as_str());
+        }
         if self.modifiers.limit.is_some() {
             result.push_str( self.modifiers.limit.unwrap().to_string().as_str() );
         }
@@ -347,7 +354,7 @@ impl ToString for Named {
     fn to_string(&self) -> String {
         match &self.alias {
             None => self.name.clone(),
-            Some(a) => format!("{}.{}", a, self.name).to_string(),
+            Some(a) => format!("{} AS {}", self.name, a ).to_string(),
         }
     }
 }
@@ -390,7 +397,7 @@ impl ToString for RelationValue {
             COL(s) => s.clone(),
             RelationValue::LIST( lst ) => {
                 let mut result = String::from( "(");
-                result.push_str( lst.iter().map( |e| e.to_string() ).join(" AND ").as_str());
+                result.push_str( lst.iter().map( |e| e.to_string() ).join(", ").as_str());
                 result.push( ')');
                 result
             }
@@ -932,7 +939,7 @@ impl CassandraParser {
             modifiers: StatementModifiers::new(),
             elements: vec!(),
             table_name: String::new(),
-            where_clause: vec!(),
+            where_clause: None,
             order : None,
         };
         // we are on SELECT so we can just start
@@ -946,6 +953,7 @@ impl CassandraParser {
                         let kind = cursor.node().kind();
                         match cursor.node().kind() {
                             "select_element" => statement_data.elements.push(CassandraParser::parse_select_element(&cursor.node(), &source)),
+                            "*" => statement_data.elements.push(SelectElement::STAR),
                             _ => {},
                         }
                         process = cursor.goto_next_sibling();
@@ -953,7 +961,7 @@ impl CassandraParser {
                     cursor.goto_parent();
                 },
                 "from_spec" => statement_data.table_name = CassandraParser::parse_from_spec(&cursor.node(), source),
-                "where_spec" => statement_data.where_clause = CassandraParser::parse_where_spec(&cursor.node(), source),
+                "where_spec" => statement_data.where_clause = Some(CassandraParser::parse_where_spec(&cursor.node(), source)),
                 "order_spec" => statement_data.order = CassandraParser::parse_order_spec(&cursor.node(), source),
                 "limit_spec" => {
                     cursor.goto_first_child();
@@ -1042,7 +1050,10 @@ impl CassandraParser {
                 // consume '('
                 cursor.goto_next_sibling();
                 while !cursor.node().kind().eq(")") {
-                    values.push(CassandraParser::parse_relation_value( cursor, source));
+                    match cursor.node().kind() {
+                        "," => {},
+                        _ => values.push(CassandraParser::parse_relation_value(cursor, source)),
+                    }
                     cursor.goto_next_sibling();
                 }
                 RelationValue::LIST(values)
@@ -1070,7 +1081,6 @@ impl CassandraParser {
         })
     }
 
-    /// walker on "select_element"
     fn parse_select_element(  node : &Node, source : &String )  -> SelectElement {
         let mut cursor = node.walk();
         cursor.goto_first_child();
@@ -1098,7 +1108,6 @@ impl CassandraParser {
                             name: NodeFuncs::as_string(&type_, source),
                             alias
                         }),
-            "*" => SelectElement::STAR,
             _ => {
                 SelectElement::DOT_STAR( NodeFuncs::as_string(&type_, source ))
             },
@@ -1274,9 +1283,11 @@ mod tests {
                         _ => assert!( false ),
                     };
 
-                    let mut relation = statement_data.where_clause.get(0);
+
+                    assert!( statement_data.where_clause.as_ref().is_some());
+                    let mut relation = statement_data.where_clause.as_ref().unwrap().get(0);
                     match &relation {
-                        Some(relation_element) => {
+                        Some( relation_element ) => {
                             match &relation_element.obj {
                                 RelationValue::COL(name) => {
                                     assert_eq!( "col", name );
@@ -1301,6 +1312,99 @@ mod tests {
                 },
             _ => assert!( false ),
         }
+    }
+
+    #[test]
+    fn test_select_statements() {
+        let stmts = [
+            "SELECT DISTINCT JSON * FROM table",
+            "SELECT column FROM table",
+            "SELECT column AS column2 FROM table",
+            "SELECT func(*) FROM table",
+            "SELECT column AS column2, func(*) AS func2 FROM table;",
+            "SELECT column FROM table WHERE col < 5",
+"SELECT column FROM table WHERE col <= 'hello'",
+            "SELECT column FROM table WHERE col = 5b6962dd-3f90-4c93-8f61-eabfa4a803e2;",
+            "SELECT column FROM table WHERE col <> -5",
+"SELECT column FROM table WHERE col >= 3.5",
+            "SELECT column FROM table WHERE col = X'E0'",
+            "SELECT column FROM table WHERE col = 0XFF",
+            "SELECT column FROM table WHERE col = true",
+            "SELECT column FROM table WHERE col = false",
+            "SELECT column FROM table WHERE col = null",
+            "SELECT column FROM table WHERE col = $$ a code's block $$",
+            "SELECT column FROM table WHERE func(*) < 5",
+            "SELECT column FROM table WHERE func(*) <= 'hello'",
+            "SELECT column FROM table WHERE func(*) = 5b6962dd-3f90-4c93-8f61-eabfa4a803e2;",
+            "SELECT column FROM table WHERE func(*) <> -5",
+            "SELECT column FROM table WHERE func(*) >= 3.5",
+            "SELECT column FROM table WHERE func(*) = X'E0'",
+            "SELECT column FROM table WHERE func(*) = 0XFF",
+            "SELECT column FROM table WHERE func(*) = true",
+            "SELECT column FROM table WHERE func(*) = false",
+            "SELECT column FROM table WHERE func(*) = func2(*)",
+            "SELECT column FROM table WHERE col IN ( 'literal', 5, func(*), true )",
+            "SELECT column FROM table WHERE (col1, col2) IN (( 5, 'stuff'), (6, 'other'));",
+            "SELECT column FROM table WHERE (col1, col2) >= ( 5, 'stuff'), (6, 'other')",
+     "SELECT column FROM table WHERE col1 CONTAINS 'foo'",
+            "SELECT column FROM table WHERE col1 CONTAINS KEY 'foo'",
+            "SELECT column FROM table ORDER BY col1",
+            "SELECT column FROM table ORDER BY col1 ASC",
+            "SELECT column FROM table ORDER BY col1 DESC",
+            "SELECT column FROM table LIMIT 5",
+            "SELECT column FROM table ALLOW FILTERING" ];
+        let expected = [
+            "SELECT DISTINCT JSON * FROM table",
+            "SELECT column FROM table",
+            "SELECT column AS column2 FROM table",
+            "SELECT func(*) FROM table",
+            "SELECT column AS column2, func(*) AS func2 FROM table",
+            "SELECT column FROM table WHERE col < 5",
+            "SELECT column FROM table WHERE col <= 'hello'",
+            "SELECT column FROM table WHERE col = 5b6962dd-3f90-4c93-8f61-eabfa4a803e2",
+            "SELECT column FROM table WHERE col <> -5",
+            "SELECT column FROM table WHERE col >= 3.5",
+            "SELECT column FROM table WHERE col = X'E0'",
+            "SELECT column FROM table WHERE col = 0XFF",
+            "SELECT column FROM table WHERE col = true",
+            "SELECT column FROM table WHERE col = false",
+            "SELECT column FROM table WHERE col = null",
+            "SELECT column FROM table WHERE col = $$ a code's block $$",
+            "SELECT column FROM table WHERE func(*) < 5",
+            "SELECT column FROM table WHERE func(*) <= 'hello'",
+            "SELECT column FROM table WHERE func(*) = 5b6962dd-3f90-4c93-8f61-eabfa4a803e2",
+            "SELECT column FROM table WHERE func(*) <> -5",
+            "SELECT column FROM table WHERE func(*) >= 3.5",
+            "SELECT column FROM table WHERE func(*) = X'E0'",
+            "SELECT column FROM table WHERE func(*) = 0XFF",
+            "SELECT column FROM table WHERE func(*) = true",
+            "SELECT column FROM table WHERE func(*) = false",
+            "SELECT column FROM table WHERE func(*) = func2(*)",
+            "SELECT column FROM table WHERE col IN ('literal', 5, func(*), true)",
+            "SELECT column FROM table WHERE (col1, col2) IN (( 5, 'stuff'), (6, 'other'))",
+            "SELECT column FROM table WHERE (col1, col2) >= (5, 'stuff'), (6, 'other')",
+            "SELECT column FROM table WHERE col1 CONTAINS 'foo'",
+            "SELECT column FROM table WHERE col1 CONTAINS KEY 'foo'",
+            "SELECT column FROM table ORDER BY col1",
+            "SELECT column FROM table ORDER BY col1 ASC",
+            "SELECT column FROM table ORDER BY col1 DESC",
+            "SELECT column FROM table LIMIT 5",
+            "SELECT column FROM table ALLOW FILTERING" ];
+        for i in 0..stmts.len() {
+            let ast = CassandraAST::new(stmts[i].to_string());
+            let stmt = ast.statement;
+            let stmt_str = stmt.to_string();
+            assert_eq!(expected[i], stmt_str);
+        }
+    }
+
+    #[test]
+    fn x() {
+        let qry = "SELECT column FROM table WHERE (col1, col2) IN ((5, 'stuff'), (6, 'other'))";
+        let ast = CassandraAST::new(qry.to_string());
+        let stmt = ast.statement;
+        let stmt_str = stmt.to_string();
+        assert_eq!(qry, stmt_str);
     }
 
         #[test]

@@ -329,17 +329,23 @@ impl CassandraBloomFilter {
                      */
 
 
-                if select_data.where_clause.iter().map( |re| match &re.obj {
+                if select_data.where_clause.is_some() && select_data.where_clause.as_ref().unwrap().iter().map( |re| match &re.obj {
                         RelationValue::LIST(name) => true,
                         _ => false,
                     } ).reduce( |a,b| (a|b)).unwrap() {
                     return self.make_error(state, "bloom filter processing does not yet support (column...) = (values...)");
                 }
 
-                let interesting_relations : Vec<&RelationElement>= select_data.where_clause.iter().filter( |re| match &re.obj {
-                    RelationValue::COL(name) => true,
-                    _ => false,
-                } ).collect();
+
+                let interesting_relations : Vec<&RelationElement>= if select_data.where_clause.is_some() {
+                    select_data.where_clause.as_ref().unwrap().iter().filter(|re| match &re.obj {
+                        RelationValue::COL(name) => true,
+                        _ => false,
+                    }).collect()
+                } else {
+                    vec!()
+                };
+
 
 
                 /*for relation in ast.search( "where_spec / relation_elements[column]" ).iter() {
@@ -624,7 +630,10 @@ impl BloomFilterState {
         self.added_selects.iter().for_each(|s| new_elements.push(s.clone()) );
 
         let mut new_where : Vec<RelationElement> = vec!();
-        select_data.where_clause.iter().for_each( |w|new_where.push(w.clone()) );
+
+        if select_data.where_clause.as_ref().is_some() {
+            select_data.where_clause.as_ref().unwrap().iter().for_each(|w| new_where.push(w.clone()));
+        }
         self.added_where.iter().for_each(|w|new_where.push(w.clone()) );
         new_where.retain(|w| !self.verify_funcs.contains(w));
 
@@ -632,7 +641,7 @@ impl BloomFilterState {
             modifiers: select_data.modifiers.clone(),
             table_name: select_data.table_name.clone(),
             elements: new_elements,
-            where_clause: new_where,
+            where_clause: if new_where.is_empty() { None } else { Some(new_where)},
             order: match &select_data.order {
                 None => None,
                 Some(x) => Some(x.clone()),
