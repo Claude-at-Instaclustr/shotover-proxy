@@ -59,7 +59,7 @@ pub struct DeleteColumn {
 impl Display for DeleteColumn {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.value {
-            Some(x) => write!(f, "{} [{}]", self.column, x),
+            Some(x) => write!(f, "{}[{}]", self.column, x),
             None => write!(f, "{}", self.column),
         }
     }
@@ -84,28 +84,25 @@ impl ToString for DeleteStatementData {
         }
         result.push_str("DELETE ");
         if self.columns.is_some() {
-            result.push('(');
             result.push_str(
                 self.columns
                     .as_ref()
                     .unwrap()
                     .iter()
-                    .map(|x| x.to_string())
                     .join(", ")
                     .as_str(),
             );
-            result.push_str(") ");
+            result.push(' ');
         }
         result.push_str("FROM ");
         result.push_str(&self.table_name.as_str());
         if self.timestamp.is_some() {
-            result.push_str(format!("USING TIMESTAMP {} ", self.timestamp.unwrap()).as_str());
+            result.push_str(format!(" USING TIMESTAMP {}", self.timestamp.unwrap()).as_str());
         }
-        result.push_str("WHERE ");
+        result.push_str(" WHERE ");
         result.push_str(
             self.where_clause
                 .iter()
-                .map(|w| w.to_string())
                 .join(" AND ")
                 .as_str(),
         );
@@ -661,7 +658,11 @@ impl CassandraParser {
                             &cursor.node(),
                             source,
                         ));
+                        // consume the column
+                        cursor.goto_next_sibling();
                         process = cursor.goto_next_sibling();
+                        // consume the ',' if any
+                        cursor.goto_next_sibling();
                     }
                     // bring the cursor back to delete_column_list
                     cursor.goto_parent();
@@ -1216,7 +1217,7 @@ impl CassandraParser {
                             cursor.goto_next_sibling();
                             values.push(CassandraParser::parse_operand(&cursor.node(), source));
                         }
-                        if (inline_tuple && values.len() > 1) {
+                        if inline_tuple && values.len() > 1 {
                             let mut result = vec![];
                             result.push(Operand::TUPLE(values));
                             result
@@ -1635,7 +1636,7 @@ mod tests {
         ];
         test_parsing( &expected, &stmts );
     }
-/*
+
     #[test]
     fn test_delete_statements() {
         let stmts = [
@@ -1647,12 +1648,12 @@ mod tests {
             "DELETE column, column3 from keyspace.table WHERE column2='foo' IF column4 = 'bar'",
         ];
         let expected  = [
-            "BEGIN LOGGED BATCH USING TIMESTAMP 5 DELETE column [ 'hello' ] from table WHERE column2 = 'foo' IF EXISTS",
-            "BEGIN UNLOGGED BATCH DELETE column [ 6 ] from keyspace.table USING TIMESTAMP 5 WHERE column2='foo' IF column3 = 'stuff'",
-            "BEGIN BATCH DELETE column [ 'hello' ] from keyspace.table WHERE column2='foo'",
-            "DELETE from table WHERE column2='foo'",
-            "DELETE column, column3 from keyspace.table WHERE column2='foo'",
-            "DELETE column, column3 from keyspace.table WHERE column2='foo' IF column4 = 'bar'",
+            "BEGIN LOGGED BATCH USING TIMESTAMP 5 DELETE column['hello'] FROM table WHERE column2 = 'foo' IF EXISTS",
+            "BEGIN UNLOGGED BATCH DELETE column[6] FROM keyspace.table USING TIMESTAMP 5 WHERE column2 = 'foo' IF column3 = 'stuff'",
+            "BEGIN BATCH DELETE column['hello'] FROM keyspace.table WHERE column2 = 'foo'",
+            "DELETE FROM table WHERE column2 = 'foo'",
+            "DELETE column, column3 FROM keyspace.table WHERE column2 = 'foo'",
+            "DELETE column, column3 FROM keyspace.table WHERE column2 = 'foo' IF column4 = 'bar'",
         ];
         test_parsing( &expected, &stmts );
     }
@@ -1665,7 +1666,7 @@ mod tests {
         let stmt_str = stmt.to_string();
         assert_eq!(qry, stmt_str);
     }
-*/
+
     #[test]
     fn test_get_statement_type() {
         let stmts = [
@@ -1764,26 +1765,29 @@ mod tests {
 
     #[test]
     fn test_truncate() {
-        let ast = CassandraAST::new("TRUNCATE TABLE foo".to_string());
-        match ast.statement {
-            CassandraStatement::Truncate(table) => assert_eq!("foo", table),
-            _ => assert!(false),
-        }
-        let ast = CassandraAST::new("TRUNCATE foo".to_string());
-        match ast.statement {
-            CassandraStatement::Truncate(table) => assert_eq!("foo", table),
-            _ => assert!(false),
-        }
+        let stmts = [
+            "TRUNCATE foo",
+            "TRUNCATE TABLE foo",
+            "TRUNCATE keyspace.foo",
+            "TRUNCATE TABLE keyspace.foo",
+        ];
+        let expected  = [
+            "TRUNCATE TABLE foo",
+            "TRUNCATE TABLE foo",
+            "TRUNCATE TABLE keyspace.foo",
+            "TRUNCATE TABLE keyspace.foo",
+        ];
+        test_parsing( &expected, &stmts );
+    }
 
-        let ast = CassandraAST::new("TRUNCATE TABLE foo.bar".to_string());
-        match ast.statement {
-            CassandraStatement::Truncate(table) => assert_eq!("foo.bar", table),
-            _ => assert!(false),
-        }
-        let ast = CassandraAST::new("TRUNCATE foo.bar".to_string());
-        match ast.statement {
-            CassandraStatement::Truncate(table) => assert_eq!("foo.bar", table),
-            _ => assert!(false),
-        }
+    #[test]
+    fn test_use() {
+        let stmts = [
+            "USE keyspace",
+        ];
+        let expected  = [
+            "USE keyspace",
+        ];
+        test_parsing( &expected, &stmts );
     }
 }
