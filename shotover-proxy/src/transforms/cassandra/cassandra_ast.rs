@@ -28,16 +28,16 @@ pub enum CassandraStatement {
     CreateType,
     CreateUser,
     DeleteStatement(DeleteStatementData),
-    DropAggregate,
-    DropFunction,
-    DropIndex,
-    DropKeyspace,
-    DropMaterializedView,
-    DropRole,
-    DropTable,
+    DropAggregate(DropData),
+    DropFunction(DropData),
+    DropIndex(DropData),
+    DropKeyspace(DropData),
+    DropMaterializedView(DropData),
+    DropRole(DropData),
+    DropTable(DropData),
     DropTrigger,
-    DropType,
-    DropUser,
+    DropType(DropData),
+    DropUser(DropData),
     Grant,
     InsertStatement(InsertStatementData),
     ListPermissions,
@@ -84,14 +84,7 @@ impl ToString for DeleteStatementData {
         }
         result.push_str("DELETE ");
         if self.columns.is_some() {
-            result.push_str(
-                self.columns
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .join(", ")
-                    .as_str(),
-            );
+            result.push_str(self.columns.as_ref().unwrap().iter().join(", ").as_str());
             result.push(' ');
         }
         result.push_str("FROM ");
@@ -100,12 +93,7 @@ impl ToString for DeleteStatementData {
             result.push_str(format!(" USING TIMESTAMP {}", self.timestamp.unwrap()).as_str());
         }
         result.push_str(" WHERE ");
-        result.push_str(
-            self.where_clause
-                .iter()
-                .join(" AND ")
-                .as_str(),
-        );
+        result.push_str(self.where_clause.iter().join(" AND ").as_str());
 
         if self.if_spec.is_some() {
             result.push_str(" IF ");
@@ -169,27 +157,19 @@ pub struct TtlTimestamp {
 impl Display for TtlTimestamp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let tl = match self.ttl {
-            Some(t) => format!( "TTL {}", t),
+            Some(t) => format!("TTL {}", t),
             _ => "".to_string(),
         };
 
         let tm = match self.timestamp {
-                Some(t) => format!("TIMESTAMP {}", t),
-                _ => "".to_string(),
-            };
+            Some(t) => format!("TIMESTAMP {}", t),
+            _ => "".to_string(),
+        };
 
         if self.ttl.is_some() && self.timestamp.is_some() {
-            write!(
-                f,
-                " USING {} AND {}",
-                tl, tm
-            )
+            write!(f, " USING {} AND {}", tl, tm)
         } else {
-            write!(
-                f,
-                " USING {}",
-                if self.ttl.is_some() { tl } else {tm}
-            )
+            write!(f, " USING {}", if self.ttl.is_some() { tl } else { tm })
         }
     }
 }
@@ -267,7 +247,7 @@ impl Display for Operand {
         match self {
             Operand::COLUMN(text) | Operand::FUNC(text) | Operand::CONST(text) => {
                 write!(f, "{}", text)
-            },
+            }
             Operand::MAP(entries) => {
                 let mut result = String::from('{');
                 result.push_str(
@@ -279,25 +259,25 @@ impl Display for Operand {
                 );
                 result.push('}');
                 write!(f, "{}", result)
-            },
+            }
             Operand::SET(values) => {
                 let mut result = String::from('{');
                 result.push_str(values.iter().join(", ").as_str());
                 result.push('}');
                 write!(f, "{}", result)
-            },
+            }
             Operand::LIST(values) => {
                 let mut result = String::from('[');
                 result.push_str(values.iter().join(", ").as_str());
                 result.push(']');
                 write!(f, "{}", result)
-            },
+            }
             Operand::TUPLE(values) => {
                 let mut result = String::from('(');
                 result.push_str(values.iter().join(", ").as_str());
                 result.push(')');
                 write!(f, "{}", result)
-            },
+            }
         }
     }
 }
@@ -525,6 +505,23 @@ impl StatementModifiers {
     }
 }
 
+#[derive(PartialEq, Debug, Clone)]
+pub struct DropData {
+    name: String,
+    if_exists: bool,
+}
+
+impl DropData {
+    pub fn get_text(&self, type_: &str) -> String {
+        format!(
+            "DROP {}{} {}",
+            type_,
+            if self.if_exists { " IF EXISTS" } else { "" },
+            self.name
+        )
+    }
+}
+
 struct NodeFuncs {}
 
 impl NodeFuncs {
@@ -566,16 +563,34 @@ impl CassandraStatement {
             "delete_statement" => CassandraStatement::DeleteStatement(
                 CassandraParser::build_delete_statement(node, source),
             ),
-            "drop_aggregate" => CassandraStatement::DropAggregate,
-            "drop_function" => CassandraStatement::DropFunction,
-            "drop_index" => CassandraStatement::DropIndex,
-            "drop_keyspace" => CassandraStatement::DropKeyspace,
-            "drop_materialized_view" => CassandraStatement::DropMaterializedView,
-            "drop_role" => CassandraStatement::DropRole,
-            "drop_table" => CassandraStatement::DropTable,
+            "drop_aggregate" => CassandraStatement::DropAggregate(
+                CassandraParser::parse_standard_drop(&node, source),
+            ),
+            "drop_function" => CassandraStatement::DropFunction(
+                CassandraParser::parse_standard_drop(&node, source),
+            ),
+            "drop_index" => {
+                CassandraStatement::DropIndex(CassandraParser::parse_standard_drop(&node, source))
+            }
+            "drop_keyspace" => CassandraStatement::DropKeyspace(
+                CassandraParser::parse_standard_drop(&node, source),
+            ),
+            "drop_materialized_view" => CassandraStatement::DropMaterializedView(
+                CassandraParser::parse_standard_drop(&node, source),
+            ),
+            "drop_role" => {
+                CassandraStatement::DropRole(CassandraParser::parse_standard_drop(&node, source))
+            }
+            "drop_table" => {
+                CassandraStatement::DropTable(CassandraParser::parse_standard_drop(&node, source))
+            }
             "drop_trigger" => CassandraStatement::DropTrigger,
-            "drop_type" => CassandraStatement::DropType,
-            "drop_user" => CassandraStatement::DropUser,
+            "drop_type" => {
+                CassandraStatement::DropType(CassandraParser::parse_standard_drop(&node, source))
+            }
+            "drop_user" => {
+                CassandraStatement::DropUser(CassandraParser::parse_standard_drop(&node, source))
+            }
             "grant" => CassandraStatement::Grant,
             "insert_statement" => CassandraStatement::InsertStatement(
                 CassandraParser::build_insert_statement(node, source),
@@ -778,7 +793,6 @@ impl CassandraParser {
                         if cursor.node().kind().eq("column_list") {
                             statement_data.columns =
                                 Some(CassandraParser::parse_column_list(&cursor.node(), source));
-
                         }
                     }
                     cursor.goto_parent();
@@ -817,7 +831,6 @@ impl CassandraParser {
                         Some(CassandraParser::parse_ttl_timestamp(&cursor.node(), source));
                 }
                 _ => {}
-
             }
             process = cursor.goto_next_sibling();
         }
@@ -880,10 +893,7 @@ impl CassandraParser {
                 _ => {}
             }
         }
-        TtlTimestamp {
-            ttl,
-            timestamp,
-        }
+        TtlTimestamp { ttl, timestamp }
     }
 
     fn parse_from_spec(node: &Node, source: &String) -> String {
@@ -894,9 +904,7 @@ impl CassandraParser {
         CassandraParser::parse_table_name(&cursor.node(), &source)
     }
 
-    fn parse_table_name(node: &Node, source: &String) -> String {
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
+    fn parse_dotted_name(cursor: &mut TreeCursor, source: &String) -> String {
         let mut result = NodeFuncs::as_string(&cursor.node(), source);
         if cursor.goto_next_sibling() {
             // we have fully qualified name
@@ -906,6 +914,11 @@ impl CassandraParser {
             result.push_str(NodeFuncs::as_string(&cursor.node(), source).as_str());
         }
         result
+    }
+    fn parse_table_name(node: &Node, source: &String) -> String {
+        let mut cursor = node.walk();
+        cursor.goto_first_child();
+        CassandraParser::parse_dotted_name(&mut cursor, source)
     }
 
     fn parse_function_args(node: &Node, source: &String) -> Vec<Operand> {
@@ -1025,7 +1038,7 @@ impl CassandraParser {
         // now on 'expression-list'
         CassandraParser::parse_expression_list(&cursor.node(), source)
     }
-    /// walker on "begin_batch"
+
     fn parse_begin_batch(node: &Node, source: &String) -> BeginBatch {
         let mut result = BeginBatch::new();
 
@@ -1230,7 +1243,7 @@ impl CassandraParser {
             }
         }
     }
-    /// walker positioned before operator symbol
+
     fn parse_operator(cursor: &mut TreeCursor) -> RelationOperator {
         let node = cursor.node();
         let kind = node.kind();
@@ -1249,6 +1262,7 @@ impl CassandraParser {
             }
         }
     }
+
     fn parse_relation_value(cursor: &mut TreeCursor, source: &String) -> Operand {
         let node = cursor.node();
         let kind = node.kind();
@@ -1318,6 +1332,30 @@ impl CassandraParser {
             _ => SelectElement::DOT_STAR(NodeFuncs::as_string(&type_, source)),
         }
     }
+
+    fn parse_standard_drop(node: &Node, source: &String) -> DropData {
+        let mut cursor = node.walk();
+        let mut if_exists = false;
+        cursor.goto_first_child();
+        // consume 'DROP'
+        cursor.goto_next_sibling();
+        // consume type
+        if cursor.node().kind().eq("MATERIALIZED") {
+            cursor.goto_next_sibling();
+        }
+        cursor.goto_next_sibling();
+        if cursor.node().kind().eq("IF") {
+            if_exists = true;
+            // consume 'IF'
+            cursor.goto_next_sibling();
+            // consume 'EXISTS'
+            cursor.goto_next_sibling();
+        }
+        DropData {
+            name: CassandraParser::parse_dotted_name(&mut cursor, source),
+            if_exists,
+        }
+    }
 }
 
 impl ToString for CassandraStatement {
@@ -1343,16 +1381,18 @@ impl ToString for CassandraStatement {
             CassandraStatement::CreateType => unimplemented,
             CassandraStatement::CreateUser => unimplemented,
             CassandraStatement::DeleteStatement(statement_data) => statement_data.to_string(),
-            CassandraStatement::DropAggregate => unimplemented,
-            CassandraStatement::DropFunction => unimplemented,
-            CassandraStatement::DropIndex => unimplemented,
-            CassandraStatement::DropKeyspace => unimplemented,
-            CassandraStatement::DropMaterializedView => unimplemented,
-            CassandraStatement::DropRole => unimplemented,
-            CassandraStatement::DropTable => unimplemented,
+            CassandraStatement::DropAggregate(drop_data) => drop_data.get_text("AGGREGATE"),
+            CassandraStatement::DropFunction(drop_data) => drop_data.get_text("FUNCTION"),
+            CassandraStatement::DropIndex(drop_data) => drop_data.get_text("INDEX"),
+            CassandraStatement::DropKeyspace(drop_data) => drop_data.get_text("KEYSPACE"),
+            CassandraStatement::DropMaterializedView(drop_data) => {
+                drop_data.get_text("MATERIALIZED VIEW")
+            }
+            CassandraStatement::DropRole(drop_data) => drop_data.get_text("ROLE"),
+            CassandraStatement::DropTable(drop_data) => drop_data.get_text("TABLE"),
             CassandraStatement::DropTrigger => unimplemented,
-            CassandraStatement::DropType => unimplemented,
-            CassandraStatement::DropUser => unimplemented,
+            CassandraStatement::DropType(drop_data) => drop_data.get_text("TYPE"),
+            CassandraStatement::DropUser(drop_data) => drop_data.get_text("USER"),
             CassandraStatement::Grant => unimplemented,
             CassandraStatement::InsertStatement(statement_data) => statement_data.to_string(),
             CassandraStatement::ListPermissions => unimplemented,
@@ -1463,65 +1503,7 @@ mod tests {
     use sqlparser::test_utils::table;
     use tree_sitter::Node;
 
-    #[test]
-    fn test_select() {
-        let stmt = "SELECT column FROM table WHERE col = $$ a code's block $$;";
-        let ast = CassandraAST::new(stmt.to_string());
-        let foo = ast.statement;
-        let foo_str = foo.to_string();
-        assert_eq!(
-            "SELECT column FROM table WHERE col = $$ a code's block $$",
-            foo_str
-        );
-        print!("{:?}", foo);
-        match foo {
-            CassandraStatement::SelectStatement(statement_data) => {
-                assert!(!statement_data.modifiers.json);
-                assert!(!statement_data.modifiers.filtering);
-                assert_eq!(None, statement_data.modifiers.limit);
-                assert!(!statement_data.modifiers.distinct);
-
-                assert_eq!("table", statement_data.table_name.as_str());
-
-                let mut element = statement_data.elements.get(0);
-                match element {
-                    Some(SelectElement::COLUMN(named)) => {
-                        assert_eq!("column", named.name);
-                        assert_eq!(None, named.alias);
-                    }
-                    _ => assert!(false),
-                };
-
-                assert!(statement_data.where_clause.as_ref().is_some());
-                let mut relation = statement_data.where_clause.as_ref().unwrap().get(0);
-                match &relation {
-                    Some(relation_element) => {
-                        match &relation_element.obj {
-                            Operand::COLUMN(name) => {
-                                assert_eq!("col", name);
-                            }
-                            _ => assert!(false),
-                        };
-                        match &relation_element.oper {
-                            RelationOperator::EQ => assert!(true),
-                            _ => assert!(false),
-                        };
-                        match &relation_element.value.get(0).unwrap() {
-                            Operand::CONST(value) => {
-                                assert_eq!("$$ a code's block $$", value);
-                            }
-                            _ => assert!(false),
-                        };
-                    }
-                    _ => assert!(false),
-                }
-                assert_ne!(None, element);
-            }
-            _ => assert!(false),
-        }
-    }
-
-    fn test_parsing(expected : &[&str] , statements : &[&str]) {
+    fn test_parsing(expected: &[&str], statements: &[&str]) {
         for i in 0..statements.len() {
             let ast = CassandraAST::new(statements[i].to_string());
             let stmt = ast.statement;
@@ -1607,7 +1589,7 @@ mod tests {
             "SELECT column FROM table LIMIT 5",
             "SELECT column FROM table ALLOW FILTERING",
         ];
-        test_parsing( &expected, &stmts );
+        test_parsing(&expected, &stmts);
     }
 
     #[test]
@@ -1634,7 +1616,7 @@ mod tests {
             "INSERT INTO table (col1, col2) VALUES ([5, 6], 'foo')",
             "INSERT INTO table (col1, col2) VALUES ((5, 6), 'foo')",
         ];
-        test_parsing( &expected, &stmts );
+        test_parsing(&expected, &stmts);
     }
 
     #[test]
@@ -1655,7 +1637,7 @@ mod tests {
             "DELETE column, column3 FROM keyspace.table WHERE column2 = 'foo'",
             "DELETE column, column3 FROM keyspace.table WHERE column2 = 'foo' IF column4 = 'bar'",
         ];
-        test_parsing( &expected, &stmts );
+        test_parsing(&expected, &stmts);
     }
 
     #[test]
@@ -1687,26 +1669,12 @@ mod tests {
             "CREATE TRIGGER if not exists keyspace.trigger_name USING 'trigger_class';",
             "CREATE TYPE type ( col1 'foo');",
             "CREATE USER newuser WITH PASSWORD 'password';",
-            //"BEGIN UNLOGGED BATCH DELETE column [ 6 ] from keyspace.table USING TIMESTAMP 5 WHERE column2='foo' IF column3 = 'stuff'",
-            "DROP AGGREGATE keyspace.aggregate;",
-            "DROP FUNCTION keyspace.func;",
-            "DROP INDEX IF EXISTS idx;",
-            "DROP KEYSPACE if exists keyspace;",
-            "DROP MATERIALIZED VIEW cycling.cyclist_by_age;",
-            "DROP ROLE IF EXISTS role;",
-            "DROP TABLE IF EXISTS keyspace.table",
             "DROP TRIGGER trigger_name ON ks.table_name;",
-            "DROP TYPE IF EXISTS keyspace.type ;",
-            "DROP USER if exists user_name;",
             "GRANT ALL ON 'keyspace'.table TO role;",
-            //"INSERT INTO table (col1, col2) VALUES (( 5, 6 ), 'foo');",
             "LIST ALL;",
             "LIST ROLES;",
             "REVOKE ALL ON ALL ROLES FROM role;",
-            //"SELECT column FROM table WHERE col = $$ a code's block $$;",
-            //"TRUNCATE keyspace.table;",
             "UPDATE keyspace.table USING TIMESTAMP 3 SET col1 = 'foo' WHERE col2=5;",
-            //"USE key_name;",
             "Not a valid statement"];
         let types = [
             CassandraStatement::AlterKeyspace,
@@ -1726,26 +1694,12 @@ mod tests {
             CassandraStatement::CreateTrigger,
             CassandraStatement::CreateType,
             CassandraStatement::CreateUser,
-            //CassandraStatement::DeleteStatement,
-            CassandraStatement::DropAggregate,
-            CassandraStatement::DropFunction,
-            CassandraStatement::DropIndex,
-            CassandraStatement::DropKeyspace,
-            CassandraStatement::DropMaterializedView,
-            CassandraStatement::DropRole,
-            CassandraStatement::DropTable,
             CassandraStatement::DropTrigger,
-            CassandraStatement::DropType,
-            CassandraStatement::DropUser,
             CassandraStatement::Grant,
-            //CassandraStatement::InsertStatement,
             CassandraStatement::ListPermissions,
             CassandraStatement::ListRoles,
             CassandraStatement::Revoke,
-            //CassandraStatement::SelectStatement(data),
-            //CassandraStatement::Truncate,
             CassandraStatement::Update,
-            //CassandraStatement::UseStatement(keyspace),
             CassandraStatement::UNKNOWN("Not a valid statement".to_string()),
         ];
 
@@ -1771,23 +1725,145 @@ mod tests {
             "TRUNCATE keyspace.foo",
             "TRUNCATE TABLE keyspace.foo",
         ];
-        let expected  = [
+        let expected = [
             "TRUNCATE TABLE foo",
             "TRUNCATE TABLE foo",
             "TRUNCATE TABLE keyspace.foo",
             "TRUNCATE TABLE keyspace.foo",
         ];
-        test_parsing( &expected, &stmts );
+        test_parsing(&expected, &stmts);
     }
 
     #[test]
     fn test_use() {
+        let stmts = ["USE keyspace"];
+        let expected = ["USE keyspace"];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_aggregate() {
         let stmts = [
-            "USE keyspace",
+            "DROP AGGREGATE IF EXISTS aggregate;",
+            "DROP AGGREGATE aggregate;",
+            "DROP AGGREGATE IF EXISTS keyspace.aggregate;",
+            "DROP AGGREGATE keyspace.aggregate;",
         ];
-        let expected  = [
-            "USE keyspace",
+        let expected = [
+            "DROP AGGREGATE IF EXISTS aggregate",
+            "DROP AGGREGATE aggregate",
+            "DROP AGGREGATE IF EXISTS keyspace.aggregate",
+            "DROP AGGREGATE keyspace.aggregate",
         ];
-        test_parsing( &expected, &stmts );
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_function() {
+        let stmts = [
+            "DROP FUNCTION func;",
+            "DROP FUNCTION keyspace.func;",
+            "DROP FUNCTION IF EXISTS func;",
+            "DROP FUNCTION IF EXISTS keyspace.func;",
+        ];
+        let expected = [
+            "DROP FUNCTION func",
+            "DROP FUNCTION keyspace.func",
+            "DROP FUNCTION IF EXISTS func",
+            "DROP FUNCTION IF EXISTS keyspace.func",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let stmts = [
+            "DROP INDEX idx;",
+            "DROP INDEX keyspace.idx;",
+            "DROP INDEX IF EXISTS idx;",
+            "DROP INDEX IF EXISTS keyspace.idx;",
+        ];
+        let expected = [
+            "DROP INDEX idx",
+            "DROP INDEX keyspace.idx",
+            "DROP INDEX IF EXISTS idx",
+            "DROP INDEX IF EXISTS keyspace.idx",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_keyspace() {
+        let stmts = [
+            "DROP KEYSPACE keyspace",
+            "DROP KEYSPACE IF EXISTS keyspace;",
+        ];
+        let expected = ["DROP KEYSPACE keyspace", "DROP KEYSPACE IF EXISTS keyspace"];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_materialized_view() {
+        let stmts = [
+            "DROP MATERIALIZED VIEW view;",
+            "DROP MATERIALIZED VIEW IF EXISTS view;",
+            "DROP MATERIALIZED VIEW keyspace.view;",
+            "DROP MATERIALIZED VIEW IF EXISTS keyspace.view;",
+        ];
+        let expected = [
+            "DROP MATERIALIZED VIEW view",
+            "DROP MATERIALIZED VIEW IF EXISTS view",
+            "DROP MATERIALIZED VIEW keyspace.view",
+            "DROP MATERIALIZED VIEW IF EXISTS keyspace.view",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_role() {
+        let stmts = ["DROP ROLE role;", "DROP ROLE if exists role;"];
+        let expected = ["DROP ROLE role", "DROP ROLE IF EXISTS role"];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_table() {
+        let stmts = [
+            "DROP TABLE table;",
+            "DROP TABLE IF EXISTS table;",
+            "DROP TABLE keyspace.table;",
+            "DROP TABLE IF EXISTS keyspace.table;",
+        ];
+        let expected = [
+            "DROP TABLE table",
+            "DROP TABLE IF EXISTS table",
+            "DROP TABLE keyspace.table",
+            "DROP TABLE IF EXISTS keyspace.table",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_type() {
+        let stmts = [
+            "DROP TYPE type;",
+            "DROP TYPE IF EXISTS type;",
+            "DROP TYPE keyspace.type;",
+            "DROP TYPE IF EXISTS keyspace.type;",
+        ];
+        let expected = [
+            "DROP TYPE type",
+            "DROP TYPE IF EXISTS type",
+            "DROP TYPE keyspace.type",
+            "DROP TYPE IF EXISTS keyspace.type",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_drop_user() {
+        let stmts = ["DROP USER user;", "DROP USER IF EXISTS user;"];
+        let expected = ["DROP USER user", "DROP USER IF EXISTS user"];
+        test_parsing(&expected, &stmts);
     }
 }
