@@ -1322,9 +1322,9 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f601807a248964869e222d209fd5f8e5bcc5542e4c9b1ef21bcee4424868ce5"
+checksum = "2e52eb6380b6d2a10eb3434aec0885374490f5b82c8aaf5cd487a183c98be834"
 dependencies = [
  "ahash",
  "metrics-macros",
@@ -3052,7 +3052,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-cql"
 version = "0.0.1"
-source = "git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql#8e6172d287458c8494f2abead93b30b821b71d38"
+source = "git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql#dc825e9dad94399419ea2eb623075b33fb429dfc"
 dependencies = [
  "cc",
  "regex",
