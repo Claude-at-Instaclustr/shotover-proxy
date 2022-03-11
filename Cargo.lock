@@ -267,7 +267,7 @@ dependencies = [
  "cached_proc_macro",
  "cached_proc_macro_types",
  "futures",
- "hashbrown",
+ "hashbrown 0.11.2",
  "once_cell",
 ]
 
@@ -970,11 +970,11 @@ checksum = "eabb4a44450da02c90444cf74558da904edde8fb4e9035a9a6a4e15445af0bd7"
 
 [[package]]
 name = "halfbrown"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ed39577259d319b81a15176a32673271be2786cb463889703c58c90fe83c825"
+checksum = "49e26621a30b9fdb4f949b9c6a7fa42ce88112851c33ac4ca00bfa7848d26fb4"
 dependencies = [
- "hashbrown",
+ "hashbrown 0.12.0",
 ]
 
 [[package]]
@@ -982,6 +982,15 @@ name = "hashbrown"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab5ef0d4909ef3724cc8cce6ccc8572c5c817592e9285f5464f8e86f8bd3726e"
+dependencies = [
+ "ahash",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c21d40587b92fa6a6c6e3c1bdbf87d75511db5672f9c93175574b3a00df1758"
 dependencies = [
  "ahash",
 ]
@@ -1136,7 +1145,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282a6247722caba404c065016bbfa522806e51714c34f5dfc3e4a3a46fcb4223"
 dependencies = [
  "autocfg",
- "hashbrown",
+ "hashbrown 0.11.2",
 ]
 
 [[package]]
@@ -1368,7 +1377,7 @@ dependencies = [
  "atomic-shim",
  "crossbeam-epoch",
  "crossbeam-utils",
- "hashbrown",
+ "hashbrown 0.11.2",
  "metrics",
  "num_cpus",
  "parking_lot 0.11.2",
@@ -3052,7 +3061,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-cql"
 version = "0.0.1"
-source = "git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql#dc825e9dad94399419ea2eb623075b33fb429dfc"
+source = "git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql#fff0c4af08a01b2abbe5330d4fa68985b1577bde"
 dependencies = [
  "cc",
  "regex",

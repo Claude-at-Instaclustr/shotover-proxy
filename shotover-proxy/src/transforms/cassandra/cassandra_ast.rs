@@ -152,10 +152,9 @@ impl ToString for InsertStatementData {
             result.push_str(self.columns.as_ref().unwrap().iter().join(", ").as_str());
             result.push(')');
         }
-        result.push(' ');
         result.push_str(self.values.as_ref().unwrap().to_string().as_str());
         if self.modifiers.not_exists {
-            result.push_str(" IF EXISTS");
+            result.push_str(" IF NOT EXISTS");
         }
         if self.using_ttl.is_some() {
             result.push_str(self.using_ttl.as_ref().unwrap().to_string().as_str());
@@ -166,17 +165,35 @@ impl ToString for InsertStatementData {
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct TtlTimestamp {
-    ttl: u64,
-    timestamp: u64,
+    ttl: Option<u64>,
+    timestamp: Option<u64>,
 }
 
 impl Display for TtlTimestamp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            " USING TTL {} AND TIMESTAMP {}",
-            self.ttl, self.timestamp
-        )
+        let tl = match self.ttl {
+            Some(t) => format!( "TTL {}", t),
+            _ => "".to_string(),
+        };
+
+        let tm = match self.timestamp {
+                Some(t) => format!("TIMESTAMP {}", t),
+                _ => "".to_string(),
+            };
+
+        if self.ttl.is_some() && self.timestamp.is_some() {
+            write!(
+                f,
+                " USING {} AND {}",
+                tl, tm
+            )
+        } else {
+            write!(
+                f,
+                " USING {}",
+                if self.ttl.is_some() { tl } else {tm}
+            )
+        }
     }
 }
 
@@ -208,12 +225,12 @@ impl Display for BeginBatch {
         if self.timestamp.is_some() {
             write!(
                 f,
-                "BEGIN {}BATCH USING TIMESTAMP {}",
+                "BEGIN {}BATCH USING TIMESTAMP {} ",
                 modifiers,
                 self.timestamp.unwrap()
             )
         } else {
-            write!(f, "BEGIN {}BATCH", modifiers)
+            write!(f, "BEGIN {}BATCH ", modifiers)
         }
     }
 }
@@ -228,10 +245,10 @@ impl Display for InsertValues {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             InsertValues::VALUES(columns) => {
-                write!(f, " VALUES {}", columns.iter().join(", "))
+                write!(f, " VALUES ({})", columns.iter().join(", "))
             }
             InsertValues::JSON(text) => {
-                write!(f, "JSON {}", text)
+                write!(f, " JSON {}", text)
             }
         }
     }
@@ -253,7 +270,7 @@ impl Display for Operand {
         match self {
             Operand::COLUMN(text) | Operand::FUNC(text) | Operand::CONST(text) => {
                 write!(f, "{}", text)
-            }
+            },
             Operand::MAP(entries) => {
                 let mut result = String::from('{');
                 result.push_str(
@@ -265,25 +282,25 @@ impl Display for Operand {
                 );
                 result.push('}');
                 write!(f, "{}", result)
-            }
+            },
             Operand::SET(values) => {
                 let mut result = String::from('{');
                 result.push_str(values.iter().join(", ").as_str());
                 result.push('}');
                 write!(f, "{}", result)
-            }
+            },
             Operand::LIST(values) => {
                 let mut result = String::from('[');
                 result.push_str(values.iter().join(", ").as_str());
                 result.push(']');
                 write!(f, "{}", result)
-            }
+            },
             Operand::TUPLE(values) => {
                 let mut result = String::from('(');
                 result.push_str(values.iter().join(", ").as_str());
                 result.push(')');
                 write!(f, "{}", result)
-            }
+            },
         }
     }
 }
@@ -705,7 +722,6 @@ impl CassandraParser {
     }
 
     fn parse_delete_column_item(node: &Node, source: &String) -> DeleteColumn {
-        let mut result: Vec<String> = vec![];
         let mut cursor = node.walk();
         cursor.goto_first_child();
         DeleteColumn {
@@ -756,15 +772,22 @@ impl CassandraParser {
                 }
                 "insert_column_spec" => {
                     cursor.goto_first_child();
-                    // now on column_list
-                    statement_data.columns =
-                        Some(CassandraParser::parse_column_list(&cursor.node(), source));
+                    // consume the '(' at the beginning
+                    while cursor.goto_next_sibling() {
+                        if cursor.node().kind().eq("column_list") {
+                            statement_data.columns =
+                                Some(CassandraParser::parse_column_list(&cursor.node(), source));
+
+                        }
+                    }
                     cursor.goto_parent();
                 }
                 "insert_values_spec" => {
                     cursor.goto_first_child();
                     match cursor.node().kind() {
                         "VALUES" => {
+                            cursor.goto_next_sibling();
+                            // consume the '('
                             cursor.goto_next_sibling();
                             let expression_list =
                                 CassandraParser::parse_expression_list(&cursor.node(), source);
@@ -793,7 +816,9 @@ impl CassandraParser {
                         Some(CassandraParser::parse_ttl_timestamp(&cursor.node(), source));
                 }
                 _ => {}
+
             }
+            process = cursor.goto_next_sibling();
         }
         statement_data
     }
@@ -802,12 +827,15 @@ impl CassandraParser {
     fn parse_column_list(node: &Node, source: &String) -> Vec<String> {
         let mut result: Vec<String> = vec![];
         let mut cursor = node.walk();
-        cursor.goto_first_child();
-        // we are now on '('
-        while cursor.goto_next_sibling() {
+        let mut process = cursor.goto_first_child();
+
+        while process {
             if cursor.node().kind().eq("column") {
                 result.push(NodeFuncs::as_string(&cursor.node(), &source));
             }
+            process = cursor.goto_next_sibling();
+            // consume ',' if it is there
+            cursor.goto_next_sibling();
         }
         result
     }
@@ -817,7 +845,7 @@ impl CassandraParser {
         cursor.goto_first_child();
         // consume "USING"
         cursor.goto_next_sibling();
-        // consume TIMESTAMP
+        // consume "TIMESTAMP"
         cursor.goto_next_sibling();
         Some(
             NodeFuncs::as_string(&cursor.node(), &source)
@@ -835,17 +863,13 @@ impl CassandraParser {
         while (ttl.is_none() || timestamp.is_none()) && cursor.goto_next_sibling() {
             match cursor.node().kind() {
                 "ttl" => {
-                    // consume "TTL"
-                    cursor.goto_next_sibling();
                     ttl = Some(
                         NodeFuncs::as_string(&cursor.node(), source)
                             .parse::<u64>()
                             .unwrap(),
                     );
                 }
-                "timestamp" => {
-                    // consume TIMESTAMP
-                    cursor.goto_next_sibling();
+                "time" => {
                     timestamp = Some(
                         NodeFuncs::as_string(&cursor.node(), source)
                             .parse::<u64>()
@@ -856,8 +880,8 @@ impl CassandraParser {
             }
         }
         TtlTimestamp {
-            ttl: ttl.unwrap(),
-            timestamp: timestamp.unwrap(),
+            ttl,
+            timestamp,
         }
     }
 
@@ -917,7 +941,6 @@ impl CassandraParser {
     }
 
     fn parse_operand(node: &Node, source: &String) -> Operand {
-        let kind = node.kind();
         match node.kind() {
             "constant" => Operand::CONST(NodeFuncs::as_string(node, source)),
             "column" => Operand::COLUMN(NodeFuncs::as_string(node, &source)),
@@ -937,16 +960,18 @@ impl CassandraParser {
 
     fn parse_assignment_map(node: &Node, source: &String) -> Vec<(String, String)> {
         let mut cursor = node.walk();
+        cursor.goto_first_child();
         // { const : const, ... }
         let mut entries: Vec<(String, String)> = vec![];
+        cursor.goto_first_child();
         // we are on the '{' so we can just skip it
         while cursor.goto_next_sibling() {
             match cursor.node().kind() {
                 "}" | "," => {}
                 _ => {
                     let key = NodeFuncs::as_string(&cursor.node(), &source);
-                    // consume the ':'
                     cursor.goto_next_sibling();
+                    // consume the ':'
                     cursor.goto_next_sibling();
                     let value = NodeFuncs::as_string(&cursor.node(), &source);
                     entries.push((key, value));
@@ -958,6 +983,7 @@ impl CassandraParser {
 
     fn parse_assignment_list(node: &Node, source: &String) -> Vec<String> {
         let mut cursor = node.walk();
+        cursor.goto_first_child();
         // [ const, const, ... ]
         let mut entries: Vec<String> = vec![];
         // we are on the '[' so we can just skip it
@@ -974,6 +1000,7 @@ impl CassandraParser {
 
     fn parse_assignment_set(node: &Node, source: &String) -> Vec<String> {
         let mut cursor = node.walk();
+        cursor.goto_first_child();
         // { const, const, ... }
         let mut entries: Vec<String> = vec![];
         // we are on the '{' so we can just skip it
@@ -1054,7 +1081,6 @@ impl CassandraParser {
                 "select_elements" => {
                     let mut process = cursor.goto_first_child();
                     while process {
-                        let kind = cursor.node().kind();
                         match cursor.node().kind() {
                             "select_element" => {
                                 statement_data
@@ -1167,20 +1193,15 @@ impl CassandraParser {
             }
             _ => {
                 let result = RelationElement {
-                    obj: {
-                        let x = CassandraParser::parse_relation_value(&mut cursor, source);
-                        let txt = x.to_string();
-                        cursor.goto_next_sibling();
-                        x
-                    },
+                    obj: CassandraParser::parse_relation_value(&mut cursor, source),
                     oper: {
-                        let x = CassandraParser::parse_operator(&mut cursor, source);
-                        let txt = x.to_string();
+                        // consumer the obj
                         cursor.goto_next_sibling();
-                        x
+                        CassandraParser::parse_operator(&mut cursor)
                     },
                     value: {
-                        let kind = cursor.node().kind();
+                        // consume the oper
+                        cursor.goto_next_sibling();
                         let mut values = vec![];
                         let mut inline_tuple = if cursor.node().kind().eq("(") {
                             // inline tuple or function_args
@@ -1191,7 +1212,6 @@ impl CassandraParser {
                         };
                         values.push(CassandraParser::parse_operand(&cursor.node(), source));
                         cursor.goto_next_sibling();
-                        let kind = cursor.node().kind();
                         while cursor.node().kind().eq(",") {
                             cursor.goto_next_sibling();
                             values.push(CassandraParser::parse_operand(&cursor.node(), source));
@@ -1210,7 +1230,7 @@ impl CassandraParser {
         }
     }
     /// walker positioned before operator symbol
-    fn parse_operator(cursor: &mut TreeCursor, source: &String) -> RelationOperator {
+    fn parse_operator(cursor: &mut TreeCursor) -> RelationOperator {
         let node = cursor.node();
         let kind = node.kind();
         match kind {
@@ -1500,6 +1520,14 @@ mod tests {
         }
     }
 
+    fn test_parsing(expected : &[&str] , statements : &[&str]) {
+        for i in 0..statements.len() {
+            let ast = CassandraAST::new(statements[i].to_string());
+            let stmt = ast.statement;
+            let stmt_str = stmt.to_string();
+            assert_eq!(expected[i], stmt_str);
+        }
+    }
     #[test]
     fn test_select_statements() {
         let stmts = [
@@ -1578,23 +1606,66 @@ mod tests {
             "SELECT column FROM table LIMIT 5",
             "SELECT column FROM table ALLOW FILTERING",
         ];
-        for i in 0..stmts.len() {
-            let ast = CassandraAST::new(stmts[i].to_string());
-            let stmt = ast.statement;
-            let stmt_str = stmt.to_string();
-            assert_eq!(expected[i], stmt_str);
-        }
+        test_parsing( &expected, &stmts );
+    }
+
+    #[test]
+    fn test_insert_statements() {
+        let stmts = [
+            "BEGIN LOGGED BATCH USING TIMESTAMP 5 INSERT INTO keyspace.table (col1, col2) VALUES ('hello', 5);",
+            "INSERT INTO keyspace.table (col1, col2) VALUES ('hello', 5) IF NOT EXISTS",
+            "INSERT INTO keyspace.table (col1, col2) VALUES ('hello', 5) USING TIMESTAMP 3",
+            "INSERT INTO table VALUES ('hello', 5)",
+            "INSERT INTO table (col1, col2) JSON $$ json code $$",
+            "INSERT INTO table (col1, col2) VALUES ({ 5 : 6 }, 'foo')",
+            "INSERT INTO table (col1, col2) VALUES ({ 5, 6 }, 'foo')",
+            "INSERT INTO table (col1, col2) VALUES ([ 5, 6 ], 'foo')",
+            "INSERT INTO table (col1, col2) VALUES (( 5, 6 ), 'foo')",
+        ];
+        let expected = [
+            "BEGIN LOGGED BATCH USING TIMESTAMP 5 INSERT INTO keyspace.table (col1, col2) VALUES ('hello', 5)",
+            "INSERT INTO keyspace.table (col1, col2) VALUES ('hello', 5) IF NOT EXISTS",
+            "INSERT INTO keyspace.table (col1, col2) VALUES ('hello', 5) USING TIMESTAMP 3",
+            "INSERT INTO table VALUES ('hello', 5)",
+            "INSERT INTO table (col1, col2) JSON $$ json code $$",
+            "INSERT INTO table (col1, col2) VALUES ({5:6}, 'foo')",
+            "INSERT INTO table (col1, col2) VALUES ({5, 6}, 'foo')",
+            "INSERT INTO table (col1, col2) VALUES ([5, 6], 'foo')",
+            "INSERT INTO table (col1, col2) VALUES ((5, 6), 'foo')",
+        ];
+        test_parsing( &expected, &stmts );
+    }
+/*
+    #[test]
+    fn test_delete_statements() {
+        let stmts = [
+            "BEGIN LOGGED BATCH USING TIMESTAMP 5 DELETE column [ 'hello' ] from table WHERE column2 = 'foo' IF EXISTS",
+            "BEGIN UNLOGGED BATCH DELETE column [ 6 ] from keyspace.table USING TIMESTAMP 5 WHERE column2='foo' IF column3 = 'stuff'",
+            "BEGIN BATCH DELETE column [ 'hello' ] from keyspace.table WHERE column2='foo'",
+            "DELETE from table WHERE column2='foo'",
+            "DELETE column, column3 from keyspace.table WHERE column2='foo'",
+            "DELETE column, column3 from keyspace.table WHERE column2='foo' IF column4 = 'bar'",
+        ];
+        let expected  = [
+            "BEGIN LOGGED BATCH USING TIMESTAMP 5 DELETE column [ 'hello' ] from table WHERE column2 = 'foo' IF EXISTS",
+            "BEGIN UNLOGGED BATCH DELETE column [ 6 ] from keyspace.table USING TIMESTAMP 5 WHERE column2='foo' IF column3 = 'stuff'",
+            "BEGIN BATCH DELETE column [ 'hello' ] from keyspace.table WHERE column2='foo'",
+            "DELETE from table WHERE column2='foo'",
+            "DELETE column, column3 from keyspace.table WHERE column2='foo'",
+            "DELETE column, column3 from keyspace.table WHERE column2='foo' IF column4 = 'bar'",
+        ];
+        test_parsing( &expected, &stmts );
     }
 
     #[test]
     fn x() {
-        let qry = "SELECT column FROM table ORDER BY col1";
+        let qry = "INSERT INTO table (col1, col2) VALUES ({ 5 : 6 }, 'foo')";
         let ast = CassandraAST::new(qry.to_string());
         let stmt = ast.statement;
         let stmt_str = stmt.to_string();
         assert_eq!(qry, stmt_str);
     }
-
+*/
     #[test]
     fn test_get_statement_type() {
         let stmts = [
