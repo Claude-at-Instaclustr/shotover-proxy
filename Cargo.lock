@@ -209,7 +209,7 @@ dependencies = [
 [[package]]
 name = "bloomfilter"
 version = "0.1.0"
-source = "git+https://github.com/Claude-at-Instaclustr/rusty_bloomfilter#f268e18b80f7c5f0bb12a62e34bf508dbcd5ef14"
+source = "git+https://github.com/Claude-at-Instaclustr/rusty_bloomfilter#2fa15ef8e861e62fe84ad38aa8d7b23b2238997b"
 dependencies = [
  "itertools",
  "predicates",

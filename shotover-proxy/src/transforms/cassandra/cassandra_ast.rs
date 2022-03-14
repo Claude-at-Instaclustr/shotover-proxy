@@ -1159,10 +1159,9 @@ impl CassandraParser {
                 &cursor.node(),
                 source,
             ));
-            process = cursor.node().kind().eq("AND");
-            if process {
-                cursor.goto_next_sibling();
-            }
+            process = cursor.goto_next_sibling();
+            // consume the 'AND' if it exists
+            cursor.goto_next_sibling();
         }
         result
     }
@@ -1257,8 +1256,7 @@ impl CassandraParser {
             "IN" => RelationOperator::IN,
 
             _ => {
-                // can not happen -- so this is a nasty result
-                panic!("Unknown operator: {}", kind);
+                unreachable!("Unknown operator: {}", kind);
             }
         }
     }
@@ -1498,7 +1496,7 @@ impl SearchPattern {
 #[cfg(test)]
 mod tests {
     use crate::transforms::cassandra::cassandra_ast::{
-        CassandraAST, CassandraStatement, Operand, RelationOperator, SelectElement,
+        CassandraAST, CassandraStatement, Named, Operand, RelationOperator, SelectElement,
     };
     use sqlparser::test_utils::table;
     use tree_sitter::Node;
@@ -1526,17 +1524,20 @@ mod tests {
             "SELECT column FROM table WHERE col >= 3.5",
             "SELECT column FROM table WHERE col = X'E0'",
             "SELECT column FROM table WHERE col = 0XFF",
+            "SELECT column FROM table WHERE col = 0Xef",
             "SELECT column FROM table WHERE col = true",
             "SELECT column FROM table WHERE col = false",
             "SELECT column FROM table WHERE col = null",
+            "SELECT column FROM table WHERE col = null AND col2 = 'jinx'",
             "SELECT column FROM table WHERE col = $$ a code's block $$",
             "SELECT column FROM table WHERE func(*) < 5",
             "SELECT column FROM table WHERE func(*) <= 'hello'",
             "SELECT column FROM table WHERE func(*) = 5b6962dd-3f90-4c93-8f61-eabfa4a803e2;",
             "SELECT column FROM table WHERE func(*) <> -5",
             "SELECT column FROM table WHERE func(*) >= 3.5",
-            "SELECT column FROM table WHERE func(*) = X'E0'",
+            "SELECT column FROM table WHERE func(*) = X'e0'",
             "SELECT column FROM table WHERE func(*) = 0XFF",
+            "SELECT column FROM table WHERE func(*) = 0Xff",
             "SELECT column FROM table WHERE func(*) = true",
             "SELECT column FROM table WHERE func(*) = false",
             "SELECT column FROM table WHERE func(*) = func2(*)",
@@ -1564,17 +1565,20 @@ mod tests {
             "SELECT column FROM table WHERE col >= 3.5",
             "SELECT column FROM table WHERE col = X'E0'",
             "SELECT column FROM table WHERE col = 0XFF",
+            "SELECT column FROM table WHERE col = 0Xef",
             "SELECT column FROM table WHERE col = true",
             "SELECT column FROM table WHERE col = false",
             "SELECT column FROM table WHERE col = null",
+            "SELECT column FROM table WHERE col = null AND col2 = 'jinx'",
             "SELECT column FROM table WHERE col = $$ a code's block $$",
             "SELECT column FROM table WHERE func(*) < 5",
             "SELECT column FROM table WHERE func(*) <= 'hello'",
             "SELECT column FROM table WHERE func(*) = 5b6962dd-3f90-4c93-8f61-eabfa4a803e2",
             "SELECT column FROM table WHERE func(*) <> -5",
             "SELECT column FROM table WHERE func(*) >= 3.5",
-            "SELECT column FROM table WHERE func(*) = X'E0'",
+            "SELECT column FROM table WHERE func(*) = X'e0'",
             "SELECT column FROM table WHERE func(*) = 0XFF",
+            "SELECT column FROM table WHERE func(*) = 0Xff",
             "SELECT column FROM table WHERE func(*) = true",
             "SELECT column FROM table WHERE func(*) = false",
             "SELECT column FROM table WHERE func(*) = func2(*)",
@@ -1642,7 +1646,7 @@ mod tests {
 
     #[test]
     fn x() {
-        let qry = "INSERT INTO table (col1, col2) VALUES ({ 5 : 6 }, 'foo')";
+        let qry = "SELECT foo FROM myTable WHERE bfCol1 <> 'bar' and filterColumn = 0X02000000000020000000000000000080";
         let ast = CassandraAST::new(qry.to_string());
         let stmt = ast.statement;
         let stmt_str = stmt.to_string();
