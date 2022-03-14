@@ -138,19 +138,21 @@ impl CassandraBloomFilter {
 
     /// process the query message.  This method has to handle all possible Queries that could
     /// impact the Bloom filter.
-    fn process_query(self, state: &mut BloomFilterState) -> Option<Message> {
+    fn process_query(&self, state: &mut BloomFilterState) -> Option<Message> {
         match &state.statement {
             CassandraStatement::SelectStatement(statement_data) => {
-                let cfg = self.tables.get(&statement_data.table_name);
+                let table_name = state.fixup_table_name( statement_data.table_name.clone() );
+                let cfg = self.tables.get(&table_name);
                 match cfg {
                     None => {
                         state.ignore = true;
                         None
                     }
-                    Some(_) => {
-                        let select_data = statement_data.clone();
+                    Some(config) => {
+                        let mut select_data = statement_data.clone();
+                        select_data.table_name = table_name;
                         let result =
-                            CassandraBloomFilter::process_select(state, cfg.unwrap(), &select_data);
+                            CassandraBloomFilter::process_select(state, config, &select_data);
                         if result.is_err() {
                             self.make_error(state, result.err().unwrap())
                         } else {
@@ -673,6 +675,30 @@ pub struct BloomFilterState {
 }
 
 impl BloomFilterState {
+
+    /// create a new BloomFilterState
+    pub fn new(ast: &CassandraAST, msg: Option<Message>) -> BloomFilterState {
+        BloomFilterState {
+            statement: ast.statement.clone(),
+            ignore: false,
+            original_msg: msg,
+            verify_funcs: vec![],
+            added_selects: vec![],
+            added_where: vec![],
+            added_values: vec![],
+            default_keyspace: None,
+        }
+    }
+
+    /// converts to lower case and adds default_keyspace if defined and keyspace not specified.
+    pub fn fixup_table_name(&self, table_name : String ) -> String {
+        if self.default_keyspace.is_none() || table_name.contains(".") {
+            table_name.to_lowercase()
+        } else {
+            format!( "{}.{}", self.default_keyspace.as_ref().unwrap(), table_name ).to_lowercase()
+        }
+    }
+
     /// rewrite the select statement data as a _NEW_ select statement data object.
     pub fn rewrite_select(&self, select_data: &SelectStatementData) -> SelectStatementData {
         let mut new_elements: Vec<SelectElement> = vec![];
@@ -930,6 +956,52 @@ mod test {
         match result {
             None => assert_eq!(true, state.ignore),
             Some(statement_data) => assert!(false),
+        }
+    }
+
+    #[test]
+    pub fn test_use_modifies_select() {
+
+        let select_stmt = "use HELLO".to_string();
+        let ast = CassandraAST::new(select_stmt.clone());
+
+        let mut tables : HashMap<String,CassandraBloomFilterTableConfig> = HashMap::new();
+        tables.insert( "hello.mytable".to_string(), CassandraBloomFilterTableConfig {
+            keyspace: "".to_string(),
+            table: "myTable".to_string(),
+            bloom_column: "filterColumn".to_string(),
+            bits: 72,
+            funcs: 3,
+            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
+        }
+        );
+
+        let filter = CassandraBloomFilter::new( &tables, "testing_chain".to_string() );
+
+        let mut state = BloomFilterState::new( &ast, None );
+
+        let msg = filter.process_query( &mut state);
+        assert_eq!( None, msg );
+        assert_eq!( "hello.mytable", state.fixup_table_name( "MyTable".to_string() ));
+
+        let select_stmt = "select * from mytable where bfCol1 = 'foo'".to_string();
+        let ast = CassandraAST::new(select_stmt.clone());
+        state.statement = ast.statement.clone();
+        state.original_msg=Some( build_message( &select_stmt ));
+
+        let msg = filter.process_query( &mut state );
+        match msg {
+            Some(mut m) => {
+                let y = m.frame().unwrap().clone().into_cassandra().unwrap();
+                let z = match y.operation {
+                    CassandraOperation::Query { query, params } => { query.to_query_string()},
+                    _ => "ERROR".to_string(),
+                };
+                let new_ast = CassandraAST::new( z );
+                assert!( ! new_ast.has_error() );
+                assert_eq!( "SELECT * FROM hello.mytable WHERE filterColumn = 0X0200000008000040", new_ast.statement.to_string());
+            },
+            None => assert!(false),
         }
     }
 }
