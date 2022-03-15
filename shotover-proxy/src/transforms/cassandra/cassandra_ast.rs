@@ -405,6 +405,15 @@ pub struct Named {
     pub(crate) alias: Option<String>,
 }
 
+impl Named {
+    pub fn alias_or_name(&self) -> String {
+        match &self.alias {
+            None => self.name.clone(),
+            Some(alias) => alias.clone(),
+        }
+    }
+}
+
 impl Display for Named {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.alias {
@@ -441,6 +450,12 @@ pub struct RelationElement {
     pub value: Vec<Operand>,
 }
 
+impl RelationElement {
+    pub fn first_value(&self) -> &Operand {
+        self.value.get(0).unwrap()
+    }
+}
+
 impl Display for RelationElement {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -464,6 +479,24 @@ pub enum RelationOperator {
     IN,
     CONTAINS,
     CONTAINS_KEY,
+}
+
+impl RelationOperator {
+    pub fn eval<T>( &self, left: &T, right : &T )-> bool
+    where T : PartialOrd
+         {
+        match self {
+            RelationOperator::LT => left.lt(right),
+            RelationOperator::LE => left.le( right ),
+            RelationOperator::EQ => left.eq( right ),
+            RelationOperator::NE => ! left.eq( right ),
+            RelationOperator::GE => left.ge( right ),
+            RelationOperator::GT => left.gt( right ),
+            RelationOperator::IN => false,
+            RelationOperator::CONTAINS => false,
+            RelationOperator::CONTAINS_KEY => false,
+        }
+    }
 }
 
 impl Display for RelationOperator {
