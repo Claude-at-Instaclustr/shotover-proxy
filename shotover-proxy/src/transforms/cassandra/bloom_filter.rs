@@ -108,8 +108,8 @@ impl CassandraBloomFilter {
     }
 
     /// encode the bloom filter for a blob colum in Cassandra
-    fn make_filter_column(bloomFilter: Box<dyn BloomFilter>) -> String {
-        let bitmaps = bloomFilter.get_bitmaps();
+    fn make_filter_column(bloom_filter: Box<dyn BloomFilter>) -> String {
+        let bitmaps = bloom_filter.get_bitmaps();
 
         let mut parts: Vec<String> = Vec::with_capacity(bitmaps.len() + 1);
         parts.push("0x".to_string());
@@ -341,34 +341,6 @@ impl CassandraBloomFilter {
             // to the selected columns
             let has_filter = column_names.contains(&config.bloom_column);
 
-            // create a list of columns in the where clause that match the columns we are interested in
-            let interesting_columns: Vec<&String> = column_names
-                .iter()
-                .filter(|n| config.columns.contains(n))
-                .collect();
-
-            /*
-            Removing interesting columns from the where clause.
-            Retaining a list of the comparisons to check on the return
-            adding the bloom filter if necessary.
-            Now we process the relations by moving interesting columns into the select clause,
-
-            relations come in several flavors:
-                column comparator constant
-                function comparator constant
-                function comparator function
-                column IN ( function_args )
-                (column ...) IN ( tuple...)
-                (column ...) comparator tuple...
-                column CONTAINS constant
-                column CONTAINS KEY constant
-
-            a tuple is defined as
-                tuple => ( constant, (constant | tuple )...)
-                    or  (constant (tuple ...))
-            we are only interested in the ones that have columns
-             */
-
             if select_data.where_clause.is_some()
                 && select_data
                     .where_clause
@@ -376,7 +348,7 @@ impl CassandraBloomFilter {
                     .unwrap()
                     .iter()
                     .map(|re| match &re.obj {
-                        Operand::LIST(name) => true,
+                        Operand::LIST(_) => true,
                         _ => false,
                     })
                     .reduce(|a, b| (a | b))
@@ -438,10 +410,13 @@ impl CassandraBloomFilter {
                 state.verify_funcs.push(relation.clone())
             }
             // remove duplicate select columns
-            state
-                .added_selects
-                .retain(|s| !selected_columns.contains(&s.to_string()));
-
+            if select_data.elements.contains( &SelectElement::STAR) {
+                state.added_selects.truncate(0);
+            } else {
+                state
+                    .added_selects
+                    .retain(|s| !selected_columns.contains(&s.to_string()));
+            }
             // build the bloom filter
             if !has_filter {
                 let shape = Shape {
@@ -726,7 +701,7 @@ impl BloomFilterState {
             .iter()
             .for_each(|w| new_where.push(w.clone()));
 
-        SelectStatementData {
+        let mut result = SelectStatementData {
             modifiers: select_data.modifiers.clone(),
             table_name: select_data.table_name.clone(),
             elements: new_elements,
@@ -739,7 +714,9 @@ impl BloomFilterState {
                 None => None,
                 Some(x) => Some(x.clone()),
             },
-        }
+        };
+        result.modifiers.limit = None;
+        result
     }
 }
 
@@ -821,6 +798,7 @@ mod test {
             result.unwrap()
         }
     }
+
     #[test]
     pub fn test_process_select() {
         let config = CassandraBloomFilterTableConfig {
@@ -985,6 +963,52 @@ mod test {
         assert_eq!( "hello.mytable", state.fixup_table_name( "MyTable".to_string() ));
 
         let select_stmt = "select * from mytable where bfCol1 = 'foo'".to_string();
+        let ast = CassandraAST::new(select_stmt.clone());
+        state.statement = ast.statement.clone();
+        state.original_msg=Some( build_message( &select_stmt ));
+
+        let msg = filter.process_query( &mut state );
+        match msg {
+            Some(mut m) => {
+                let y = m.frame().unwrap().clone().into_cassandra().unwrap();
+                let z = match y.operation {
+                    CassandraOperation::Query { query, params } => { query.to_query_string()},
+                    _ => "ERROR".to_string(),
+                };
+                let new_ast = CassandraAST::new( z );
+                assert!( ! new_ast.has_error() );
+                assert_eq!( "SELECT * FROM hello.mytable WHERE filterColumn = 0X0200000008000040", new_ast.statement.to_string());
+            },
+            None => assert!(false),
+        }
+    }
+
+    #[test]
+    pub fn test_limit_removed_when_select_processed() {
+
+        let select_stmt = "use HELLO".to_string();
+        let ast = CassandraAST::new(select_stmt.clone());
+
+        let mut tables : HashMap<String,CassandraBloomFilterTableConfig> = HashMap::new();
+        tables.insert( "hello.mytable".to_string(), CassandraBloomFilterTableConfig {
+            keyspace: "".to_string(),
+            table: "myTable".to_string(),
+            bloom_column: "filterColumn".to_string(),
+            bits: 72,
+            funcs: 3,
+            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
+        }
+        );
+
+        let filter = CassandraBloomFilter::new( &tables, "testing_chain".to_string() );
+
+        let mut state = BloomFilterState::new( &ast, None );
+
+        let msg = filter.process_query( &mut state);
+        assert_eq!( None, msg );
+        assert_eq!( "hello.mytable", state.fixup_table_name( "MyTable".to_string() ));
+
+        let select_stmt = "select * from mytable where bfCol1 = 'foo' LIMIT 5".to_string();
         let ast = CassandraAST::new(select_stmt.clone());
         state.statement = ast.statement.clone();
         state.original_msg=Some( build_message( &select_stmt ));

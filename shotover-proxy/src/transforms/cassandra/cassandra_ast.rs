@@ -484,12 +484,12 @@ impl Display for RelationOperator {
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct StatementModifiers {
-    distinct: bool,
-    json: bool,
-    limit: Option<i32>,
-    filtering: bool,
-    not_exists: bool,
-    exists: bool,
+    pub distinct: bool,
+    pub json: bool,
+    pub limit: Option<i32>,
+    pub filtering: bool,
+    pub not_exists: bool,
+    pub exists: bool,
 }
 
 impl StatementModifiers {
