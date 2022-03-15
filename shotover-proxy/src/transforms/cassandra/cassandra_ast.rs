@@ -4,6 +4,7 @@ use regex::Regex;
 use std::borrow::Borrow;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
+use cassandra_protocol::types::from_cursor_string_list;
 use tree_sitter::{
     Language, LogType, Node, Parser, Query, QueryCapture, QueryCursor, QueryMatch, Tree, TreeCursor,
 };
@@ -45,18 +46,96 @@ pub enum CassandraStatement {
     Revoke,
     SelectStatement(SelectStatementData),
     Truncate(String),
-    Update,
+    Update(UpdateStatementData),
     UseStatement(String),
     UNKNOWN(String),
 }
 
 #[derive(PartialEq, Debug, Clone)]
-pub struct DeleteColumn {
+pub struct UpdateStatementData {
+    pub modifiers: StatementModifiers,
+    pub begin_batch: Option<BeginBatch>,
+    pub table_name: String,
+    pub using_ttl: Option<TtlTimestamp>,
+    pub assignments: Vec<AssignmentElement>,
+    pub where_clause: Vec<RelationElement>,
+    pub if_spec: Option<Vec<(String, String)>>,
+}
+
+impl ToString for UpdateStatementData {
+    fn to_string(&self) -> String {
+        let mut result = String::new();
+        if self.begin_batch.is_some() {
+            result.push_str(self.begin_batch.as_ref().unwrap().to_string().as_str());
+        }
+        result.push_str( "UPDATE ");
+        result.push_str(self.table_name.as_str());
+        if self.using_ttl.is_some() {
+            result.push_str( self.using_ttl.as_ref().unwrap().to_string().as_str());
+        }
+        result.push_str( " SET ")
+        result.push_str( self.assignments.iter().map( |a| a.to_string()).join(",").as_str() );
+        result.push_str(" WHERE ");
+        result.push_str(
+            self.where_clause
+                .iter()
+                .join(" AND ")
+                .as_str(),
+        );
+        if self.if_spec.is_some() {
+            result.push_str(" IF ");
+            result.push_str(
+                self.if_spec
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|(x, y)| format!("{} = {}", x, y))
+                    .join(" AND ")
+                    .as_str(),
+            );
+        } else if self.modifiers.exists {
+            result.push_str(" IF EXISTS");
+        }
+        result
+    }
+}
+
+pub struct AssignmentElement {
+    pub name : IndexedColumn,
+    pub value : Operand,
+    pub operator : Option<AssignmentOperator>,
+}
+
+impl Display for AssignmentElement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.operator {
+            Some(x) => write!(f, "{} = {}{}", self.name, self.value, x),
+            None => write!(f, "{} = {}", self.name, self.value),
+        }
+    }
+}
+
+pub enum AssignmentOperator {
+    Plus(Operand),
+    Minus(Operand),
+}
+
+impl Display for AssignmentOperator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AssignmentOperator::Plus(op) => write!( f, " + {}", op),
+            AssignmentOperator::Minus(op) => write!( f, " - {}", op),
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct IndexedColumn {
     column: String,
     value: Option<String>,
 }
 
-impl Display for DeleteColumn {
+impl Display for IndexedColumn {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.value {
             Some(x) => write!(f, "{}[{}]", self.column, x),
@@ -69,11 +148,12 @@ impl Display for DeleteColumn {
 pub struct DeleteStatementData {
     pub modifiers: StatementModifiers,
     pub begin_batch: Option<BeginBatch>,
-    pub columns: Option<Vec<DeleteColumn>>,
+    pub columns: Option<Vec<IndexedColumn>>,
     pub table_name: String,
     pub timestamp: Option<u64>,
     pub where_clause: Vec<RelationElement>,
     pub if_spec: Option<Vec<(String, String)>>,
+
 }
 
 impl ToString for DeleteStatementData {
@@ -666,6 +746,98 @@ impl CassandraStatement {
 
 struct CassandraParser {}
 impl CassandraParser {
+    pub fn build_update_statement(node: &Node, source: &String) -> UpdateStatementData {
+        /*
+         optional( $.begin_batch),
+                kw( "UPDATE"),
+                dotted_name( $.object_name, $.object_name, "table"),
+                optional( $.using_ttl_timestamp),
+                kw( "SET"),
+                commaSep1( $.assignment_element),
+                $.where_spec,
+                optional( choice( if_exists, $.if_spec))
+         */
+        let mut statement_data = UpdateStatementData {
+            begin_batch: None,
+            modifiers: StatementModifiers::new(),
+            table_name: String::from(""),
+            using_ttl: None,
+            assignments: vec![],
+            where_clause: vec![],
+            if_spec: None
+        };
+        let mut cursor = node.walk();
+        let mut process = cursor.goto_first_child();
+
+        while process {
+            let mut node = cursor.node();
+            let mut kind = node.kind();
+            match kind {
+                "begin_batch" => {
+                    statement_data.begin_batch =
+                        Some(CassandraParser::parse_begin_batch(&cursor.node(), source))
+                }
+                "UPDATE" => {
+                    cursor.goto_next_sibling();
+                    statement_data.table_name = CassandraParser::parse_dotted_name(&mut cursor, source);
+                }
+                "using_ttl_timestamp" => {
+                    statement_data.using_ttl =
+                        Some(CassandraParser::parse_ttl_timestamp(&cursor.node(), source));
+                }
+                "assignment_element" => {
+                    statement_data.assignments.push(CassandraParser::parse_assignment_statement(&cursor.node(), source) );
+                }
+                "where_spec" => {
+                    statement_data.where_clause =
+                        CassandraParser::parse_where_spec(&cursor.node(), source);
+                }
+                "IF" => {
+                    // consume EXISTS
+                    cursor.goto_next_sibling();
+                    statement_data.modifiers.exists = true;
+                }
+                "if_spec" => {
+                    cursor.goto_first_child();
+                    // consume IF
+                    cursor.goto_next_sibling();
+                    statement_data.if_spec =
+                        CassandraParser::parse_if_condition_list(&cursor.node(), source);
+                    cursor.goto_parent();
+                }
+                _ => {}
+            }
+            process = cursor.goto_next_sibling();
+        }
+        statement_data
+    }
+
+    fn parse_assignment_element(node : &Node, source : &String) -> AssignmentElement {
+        let mut cursor = node.walk();
+        cursor.goto_first_child();
+        let name =  CassandraParser::parse_indexed_column( &mut cursor, source );
+        cursor.goto_next_sibling();
+        // consume the '='
+        cursor.goto_next_sibling();
+        let value = CassandraParser::parse_operand( &cursor.node(), source);
+        let mut result  = AssignmentElement {
+            name,
+            value,
+            operator: None
+        };
+        if cursor.goto_next_sibling() {
+            // we have +/- value
+            result.operator = Some(if cursor.node().kind().eq("+") {
+                cursor.goto_next_sibling();
+                AssignmentOperator::Plus(CassandraParser::parse_operand(&cursor.node(), source))
+            } else {
+                cursor.goto_next_sibling();
+                AssignmentOperator::Minus(CassandraParser::parse_operand(&cursor.node(), source))
+            });
+        }
+        result
+    }
+
     pub fn build_delete_statement(node: &Node, source: &String) -> DeleteStatementData {
         /*
                optional( $.begin_batch ),
@@ -770,10 +942,15 @@ impl CassandraParser {
         Some(result)
     }
 
-    fn parse_delete_column_item(node: &Node, source: &String) -> DeleteColumn {
+    fn parse_delete_column_item(node: &Node, source: &String) -> IndexedColumn {
         let mut cursor = node.walk();
         cursor.goto_first_child();
-        DeleteColumn {
+        CassandraParser::parse_indexed_column(&mut cursor, String)
+    }
+
+
+    fn parse_indexed_column(cursor: &mut TreeCursor, source: &String) -> IndexedColumn {
+        IndexedColumn {
             column: NodeFuncs::as_string(&cursor.node(), &source),
 
             value: if cursor.goto_next_sibling() {
@@ -1431,7 +1608,7 @@ impl ToString for CassandraStatement {
             CassandraStatement::Revoke => unimplemented,
             CassandraStatement::SelectStatement(statement_data) => statement_data.to_string(),
             CassandraStatement::Truncate(table) => format!("TRUNCATE TABLE {}", table).to_string(),
-            CassandraStatement::Update => unimplemented,
+            CassandraStatement::Update(statement_data) => statement_data.to_string(),
             CassandraStatement::UseStatement(keyspace) => format!("USE {}", keyspace).to_string(),
             CassandraStatement::UNKNOWN(_) => unimplemented,
         }
