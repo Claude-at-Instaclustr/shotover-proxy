@@ -1,13 +1,11 @@
 use itertools::Itertools;
 use regex::Regex;
 use std::fmt::{Display, Formatter};
-use tree_sitter::{
-    Node, Tree, TreeCursor,
-};
+use tree_sitter::{Node, Tree, TreeCursor};
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum CassandraStatement {
-    AlterKeyspace,
+    AlterKeyspace(KeyspaceData),
     AlterMaterializedView,
     AlterRole(RoleData),
     AlterTable,
@@ -17,7 +15,7 @@ pub enum CassandraStatement {
     CreateAggregate,
     CreateFunction,
     CreateIndex,
-    CreateKeyspace,
+    CreateKeyspace(KeyspaceData),
     CreateMaterializedView,
     CreateRole(RoleData),
     CreateTable,
@@ -665,7 +663,7 @@ impl Display for RoleData {
         if with.is_empty() {
             write!(
                 f,
-                "{}{}",
+                "ROLE {}{}",
                 if self.if_not_exists {
                     "IF NOT EXISTS "
                 } else {
@@ -676,7 +674,7 @@ impl Display for RoleData {
         } else {
             write!(
                 f,
-                "{}{} WITH {}",
+                "ROLE {}{} WITH {}",
                 if self.if_not_exists {
                     "IF NOT EXISTS "
                 } else {
@@ -689,6 +687,45 @@ impl Display for RoleData {
     }
 }
 
+#[derive(PartialEq, Debug, Clone)]
+pub struct KeyspaceData {
+    name: String,
+    replication: Vec<(String, String)>,
+    durable_writes: Option<bool>,
+    if_not_exists: bool,
+}
+impl Display for KeyspaceData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.durable_writes.is_some() {
+            write!(
+                f,
+                "KEYSPACE {}{} WITH REPLICATION = {{{}}} AND DURABLE_WRITES = {}",
+                if self.if_not_exists {
+                    "IF NOT EXISTS "
+                } else {
+                    ""
+                },
+                self.name,
+                self.replication
+                    .iter()
+                    .map(|(x, y)| format!("{}:{}", x, y))
+                    .join(", "),
+                if self.durable_writes.unwrap() {
+                    "TRUE"
+                } else {
+                    "FALSE"
+                }
+            )
+        } else {
+            write!( f,
+            "KEYSPACE {}{} WITH REPLICATION = {{{}}}",
+            if self.if_not_exists { "IF NOT EXISTS "}else{""},
+                self.name,
+                self.replication.iter().map( |(x,y) | format!("{}:{}", x, y)).join(", ")
+                    )
+        }
+    }
+}
 #[derive(PartialEq, Debug, Clone)]
 pub struct UserData {
     name: String,
@@ -715,7 +752,7 @@ impl Display for UserData {
         if with.is_empty() {
             write!(
                 f,
-                "{}{}",
+                "USER {}{}",
                 if self.if_not_exists {
                     "IF NOT EXISTS "
                 } else {
@@ -726,7 +763,7 @@ impl Display for UserData {
         } else {
             write!(
                 f,
-                "{}{} WITH{}",
+                "USER {}{} WITH{}",
                 if self.if_not_exists {
                     "IF NOT EXISTS "
                 } else {
@@ -781,7 +818,9 @@ impl CassandraStatement {
             return CassandraStatement::UNKNOWN(source.clone());
         }
         match node.kind() {
-            "alter_keyspace" => CassandraStatement::AlterKeyspace,
+            "alter_keyspace" => CassandraStatement::AlterKeyspace(
+                CassandraParser::parse_keyspace_data(node, source),
+            ),
             "alter_materialized_view" => CassandraStatement::AlterMaterializedView,
             "alter_role" => {
                 CassandraStatement::AlterRole(CassandraParser::parse_role_data(node, source))
@@ -795,7 +834,9 @@ impl CassandraStatement {
             "create_aggregate" => CassandraStatement::CreateAggregate,
             "create_function" => CassandraStatement::CreateFunction,
             "create_index" => CassandraStatement::CreateIndex,
-            "create_keyspace" => CassandraStatement::CreateKeyspace,
+            "create_keyspace" => CassandraStatement::CreateKeyspace(
+                CassandraParser::parse_keyspace_data(node, source),
+            ),
             "create_materialized_view" => CassandraStatement::CreateMaterializedView,
             "create_role" => {
                 CassandraStatement::CreateRole(CassandraParser::parse_role_data(node, source))
@@ -883,21 +924,8 @@ struct CassandraParser {}
 impl CassandraParser {
     fn parse_role_data(node: &Node, source: &String) -> RoleData {
         let mut cursor = node.walk();
-        let mut if_not_exists = false;
         cursor.goto_first_child();
-        // consume 'ALTER/CREATE'
-        cursor.goto_next_sibling();
-        // consume 'ROLE'
-        cursor.goto_next_sibling();
-        if cursor.node().kind().eq("IF") {
-            // consume 'IF'
-            cursor.goto_next_sibling();
-            // consume 'NOT'
-            cursor.goto_next_sibling();
-            // consume 'EXISTS'
-            cursor.goto_next_sibling();
-            if_not_exists = true;
-        }
+        let mut if_not_exists = CassandraParser::consume_alter_create(&mut cursor);
         let mut result = RoleData {
             name: NodeFuncs::as_string(&cursor.node(), source),
             password: None,
@@ -942,8 +970,7 @@ impl CassandraParser {
                                 cursor.goto_next_sibling();
                                 // consume the '='
                                 cursor.goto_next_sibling();
-                                result.options =
-                                    CassandraParser::parse_option_hash(&cursor.node(), source);
+                                result.options = CassandraParser::parse_map(&cursor.node(), source);
                                 cursor.goto_next_sibling();
                             }
                             _ => unreachable!(),
@@ -957,13 +984,11 @@ impl CassandraParser {
         result
     }
 
-    fn parse_user_data(node: &Node, source: &String) -> UserData {
-        let mut cursor = node.walk();
+    fn consume_alter_create(cursor: &mut TreeCursor) -> bool {
         let mut if_not_exists = false;
-        cursor.goto_first_child();
         // consume 'ALTER/CREATE'
         cursor.goto_next_sibling();
-        // consume 'USER'
+        // consume 'type'
         cursor.goto_next_sibling();
         if cursor.node().kind().eq("IF") {
             // consume 'IF'
@@ -974,6 +999,42 @@ impl CassandraParser {
             cursor.goto_next_sibling();
             if_not_exists = true;
         }
+        if_not_exists
+    }
+    fn parse_keyspace_data(node: &Node, source: &String) -> KeyspaceData {
+        let mut cursor = node.walk();
+        cursor.goto_first_child();
+        let mut if_not_exists = CassandraParser::consume_alter_create(&mut cursor);
+        let mut result = KeyspaceData {
+            name: NodeFuncs::as_string(&cursor.node(), source),
+            replication: vec![],
+            durable_writes: None,
+            if_not_exists,
+        };
+        while cursor.goto_next_sibling() {
+            match cursor.node().kind() {
+                "replication_list" => {
+                    result.replication = CassandraParser::parse_map(&cursor.node(), source);
+                },
+                "durable_writes" => {
+                    cursor.goto_first_child();
+                    // consume "DURABLE_WRITES"
+                    cursor.goto_next_sibling();
+                    // consume "="
+                    cursor.goto_next_sibling();
+                    result.durable_writes = Some(NodeFuncs::as_boolean(&cursor.node(), source));
+                    cursor.goto_parent();
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+    fn parse_user_data(node: &Node, source: &String) -> UserData {
+        let mut cursor = node.walk();
+        cursor.goto_first_child();
+        let mut if_not_exists = CassandraParser::consume_alter_create(&mut cursor);
 
         let mut result = UserData {
             name: NodeFuncs::as_string(&cursor.node(), source),
@@ -1448,7 +1509,8 @@ impl CassandraParser {
         }
     }
 
-    fn parse_option_hash(node: &Node, source: &String) -> Vec<(String, String)> {
+    // parses lists of option_hash_item or replication_list_item
+    fn parse_map(node: &Node, source: &String) -> Vec<(String, String)> {
         /*
                option_hash : $ => seq( "{", commaSep1( $.option_hash_item), "}"),
         option_hash_item : $ => seq( alias($._string_literal,"property"), ":", alias( choice( $._string_literal, $._float_literal), "value"), ),
@@ -1463,7 +1525,7 @@ impl CassandraParser {
         while cursor.goto_next_sibling() {
             match cursor.node().kind() {
                 "}" | "," => {}
-                "option_hash_item" => {
+                "option_hash_item" | "replication_list_item" => {
                     cursor.goto_first_child();
                     let key = NodeFuncs::as_string(&cursor.node(), &source);
                     cursor.goto_next_sibling();
@@ -1870,23 +1932,25 @@ impl ToString for CassandraStatement {
         // TODO remove this
         let unimplemented = String::from("Unimplemented");
         match self {
-            CassandraStatement::AlterKeyspace => unimplemented,
+            CassandraStatement::AlterKeyspace(keyspace_data) => format!("ALTER {}", keyspace_data),
             CassandraStatement::AlterMaterializedView => unimplemented,
-            CassandraStatement::AlterRole(role_data) => format!("ALTER ROLE {}", role_data),
+            CassandraStatement::AlterRole(role_data) => format!("ALTER {}", role_data),
             CassandraStatement::AlterTable => unimplemented,
             CassandraStatement::AlterType => unimplemented,
-            CassandraStatement::AlterUser(user_data) => format!("ALTER USER {}", user_data),
+            CassandraStatement::AlterUser(user_data) => format!("ALTER {}", user_data),
             CassandraStatement::ApplyBatch => String::from("APPLY BATCH"),
             CassandraStatement::CreateAggregate => unimplemented,
             CassandraStatement::CreateFunction => unimplemented,
             CassandraStatement::CreateIndex => unimplemented,
-            CassandraStatement::CreateKeyspace => unimplemented,
+            CassandraStatement::CreateKeyspace(keyspace_data) => {
+                format!("CREATE {}", keyspace_data)
+            }
             CassandraStatement::CreateMaterializedView => unimplemented,
-            CassandraStatement::CreateRole(role_data) => format!("CREATE ROLE {}", role_data),
+            CassandraStatement::CreateRole(role_data) => format!("CREATE {}", role_data),
             CassandraStatement::CreateTable => unimplemented,
             CassandraStatement::CreateTrigger => unimplemented,
             CassandraStatement::CreateType => unimplemented,
-            CassandraStatement::CreateUser(user_data) => format!("CREATE USER {}", user_data),
+            CassandraStatement::CreateUser(user_data) => format!("CREATE {}", user_data),
             CassandraStatement::DeleteStatement(statement_data) => statement_data.to_string(),
             CassandraStatement::DropAggregate(drop_data) => drop_data.get_text("AGGREGATE"),
             CassandraStatement::DropFunction(drop_data) => drop_data.get_text("FUNCTION"),
@@ -2004,9 +2068,7 @@ impl SearchPattern {
 
 #[cfg(test)]
 mod tests {
-    use crate::transforms::cassandra::cassandra_ast::{
-        CassandraAST, CassandraStatement,
-    };
+    use crate::transforms::cassandra::cassandra_ast::{CassandraAST, CassandraStatement};
 
     fn test_parsing(expected: &[&str], statements: &[&str]) {
         for i in 0..statements.len() {
@@ -2153,7 +2215,7 @@ mod tests {
 
     #[test]
     fn x() {
-        let qry = "ALTER ROLE 'role' WITH PASSWORD = 'password'";
+        let qry = "ALTER KEYSPACE keyspace WITH REPLICATION = {'foo':'bar', 'baz':5}";
         let ast = CassandraAST::new(qry.to_string());
         let stmt = ast.statement;
         let stmt_str = stmt.to_string();
@@ -2163,7 +2225,6 @@ mod tests {
     #[test]
     fn test_get_statement_type() {
         let stmts = [
-            "ALTER KEYSPACE keyspace WITH REPLICATION = { 'foo' : 'bar', 'baz' : 5};",
             "ALTER MATERIALIZED VIEW 'keyspace'.mview;",
             "ALTER TABLE keyspace.table DROP column1, column2;",
             "ALTER TYPE type ALTER column TYPE UUID;",
@@ -2171,7 +2232,6 @@ mod tests {
             "CREATE AGGREGATE keyspace.aggregate  ( ASCII ) SFUNC sfunc STYPE BIGINT FINALFUNC finalFunc INITCOND (( 5, 'text', 6.3),(4,'foo',3.14));",
             "CREATE FUNCTION IF NOT EXISTS func ( param1 int , param2 text) CALLED ON NULL INPUT RETURNS INT LANGUAGE javascript AS $$ return 5; $$;",
             "CREATE INDEX index_name ON keyspace.table (column);",
-            "CREATE KEYSPACE keyspace WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 1  };",
             "CREATE MATERIALIZED VIEW keyspace.view AS SELECT col1, col2 FROM ks_target.tbl_target WHERE col3 IS NOT NULL AND col4 IS NOT NULL AND col5 <> 'foo' PRIMARY KEY (col1) WITH option1 = 'option' AND option2 = 3.5 AND CLUSTERING ORDER BY (col2 DESC);",
             "CREATE TABLE table (col1 text, col2 int, col3 FROZEN<col4>, PRIMARY KEY (col1, col2) ) WITH option = 'option' AND option2 = 3.5;",
             "CREATE TRIGGER if not exists keyspace.trigger_name USING 'trigger_class';",
@@ -2183,7 +2243,6 @@ mod tests {
             "REVOKE ALL ON ALL ROLES FROM role;",
             "Not a valid statement"];
         let types = [
-            CassandraStatement::AlterKeyspace,
             CassandraStatement::AlterMaterializedView,
             CassandraStatement::AlterTable,
             CassandraStatement::AlterType,
@@ -2191,7 +2250,6 @@ mod tests {
             CassandraStatement::CreateAggregate,
             CassandraStatement::CreateFunction,
             CassandraStatement::CreateIndex,
-            CassandraStatement::CreateKeyspace,
             CassandraStatement::CreateMaterializedView,
             CassandraStatement::CreateTable,
             CassandraStatement::CreateTrigger,
@@ -2477,4 +2535,32 @@ mod tests {
         ];
         test_parsing(&expected, &stmts);
     }
+
+    #[test]
+    fn test_create_keyspace() {
+        let stmts = [
+            "CREATE KEYSPACE keyspace WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 1  };",
+            "CREATE KEYSPACE keyspace WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 1  } AND DURABLE_WRITES = false;",
+            "CREATE KEYSPACE if not exists keyspace WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 1  };",
+        ];
+        let expected = [
+            "CREATE KEYSPACE keyspace WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':1}",
+            "CREATE KEYSPACE keyspace WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':1} AND DURABLE_WRITES = FALSE",
+            "CREATE KEYSPACE IF NOT EXISTS keyspace WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':1}",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+    #[test]
+    fn test_alter_keyspace() {
+        let stmts = [
+            "ALTER KEYSPACE keyspace WITH REPLICATION = { 'foo' : 'bar', 'baz' : 5};",
+            "ALTER KEYSPACE keyspace WITH REPLICATION = { 'foo' : 5 } AND DURABLE_WRITES = true;",
+        ];
+        let expected = [
+            "ALTER KEYSPACE keyspace WITH REPLICATION = {'foo':'bar', 'baz':5}",
+            "ALTER KEYSPACE keyspace WITH REPLICATION = {'foo':5} AND DURABLE_WRITES = TRUE",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
 }

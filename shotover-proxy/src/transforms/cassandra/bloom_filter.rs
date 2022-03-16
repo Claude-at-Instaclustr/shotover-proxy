@@ -1342,7 +1342,7 @@ mod test {
         }));
 
         let mut state = BloomFilterState {
-            statement: CassandraStatement::AlterKeyspace,
+            statement: CassandraStatement::UNKNOWN("dummy".to_string()),
             ignore: false,
             original_msg: None,
             verify_funcs,
