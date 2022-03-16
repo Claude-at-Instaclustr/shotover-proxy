@@ -13,21 +13,21 @@ use tree_sitter::{
 pub enum CassandraStatement {
     AlterKeyspace,
     AlterMaterializedView,
-    AlterRole,
+    AlterRole(RoleData),
     AlterTable,
     AlterType,
-    AlterUser,
+    AlterUser(UserData),
     ApplyBatch,
     CreateAggregate,
     CreateFunction,
     CreateIndex,
     CreateKeyspace,
     CreateMaterializedView,
-    CreateRole,
+    CreateRole(RoleData),
     CreateTable,
     CreateTrigger,
     CreateType,
-    CreateUser,
+    CreateUser(UserData),
     DeleteStatement(DeleteStatementData),
     DropAggregate(DropData),
     DropFunction(DropData),
@@ -73,7 +73,7 @@ impl ToString for UpdateStatementData {
         if self.using_ttl.is_some() {
             result.push_str( self.using_ttl.as_ref().unwrap().to_string().as_str());
         }
-        result.push_str( " SET ")
+        result.push_str( " SET ");
         result.push_str( self.assignments.iter().map( |a| a.to_string()).join(",").as_str() );
         result.push_str(" WHERE ");
         result.push_str(
@@ -100,6 +100,7 @@ impl ToString for UpdateStatementData {
     }
 }
 
+#[derive(PartialEq, Debug, Clone)]
 pub struct AssignmentElement {
     pub name : IndexedColumn,
     pub value : Operand,
@@ -115,6 +116,7 @@ impl Display for AssignmentElement {
     }
 }
 
+#[derive(PartialEq, Debug, Clone)]
 pub enum AssignmentOperator {
     Plus(Operand),
     Minus(Operand),
@@ -619,6 +621,74 @@ impl StatementModifiers {
 }
 
 #[derive(PartialEq, Debug, Clone)]
+pub struct RoleData {
+    name: String,
+    password: Option<String>,
+    superuser: Option<bool>,
+    login: Option<bool>,
+    options: Vec<(String,String)>,
+    if_not_exists : bool,
+}
+
+impl Display for RoleData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut with = vec!();
+
+        if self.password.is_some() {
+            with.push( format!("PASSWORD = {}",self.password.as_ref().unwrap() ));
+        }
+        if self.superuser.is_some() {
+            with.push( format!("SUPERUSER = {}",if self.superuser.unwrap() { "TRUE" } else { "FALSE" }));
+        }
+        if self.login.is_some() {
+            with.push( format!("LOGIN = {}",if self.login.unwrap() { "TRUE" } else { "FALSE" }));
+        }
+        if !self.options.is_empty() {
+            let mut txt = "OPTIONS = {".to_string();
+            txt.push_str(self.options.iter().map(|(x, y)| format!("{}:{}", x, y)).join(", ").as_str());
+            txt.push('}');
+            with.push( txt.to_string() );
+        }
+        if with.is_empty() {
+            write!(f, "{}{}", if self.if_not_exists{ "IF NOT EXISTS " }else{""},self.name )
+        } else {
+            write!(f, "{}{} WITH {}", if self.if_not_exists{ "IF NOT EXISTS " }else{""},self.name, with.iter().join(" AND "))
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct UserData {
+    name: String,
+    password: Option<String>,
+    superuser: bool,
+    no_superuser:bool,
+    if_not_exists: bool,
+}
+
+impl Display for UserData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut with = String::new();
+
+            if self.password.is_some() {
+                with.push_str( " PASSWORD " );
+                with.push_str( self.password.as_ref().unwrap().as_str());
+            }
+            if self.superuser {
+                with.push_str( " SUPERUSER");
+            }
+            if self.no_superuser {
+                with.push_str(" NOSUPERUSER");
+            }
+        if with.is_empty() {
+            write!(f, "{}{}", if self.if_not_exists {"IF NOT EXISTS "}else{""}, self.name)
+        } else {
+            write!(f, "{}{} WITH{}", if self.if_not_exists {"IF NOT EXISTS "}else{""},self.name, with)
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
 pub struct DropData {
     name: String,
     if_exists: bool,
@@ -641,6 +711,10 @@ impl NodeFuncs {
     pub fn as_string(node: &Node, source: &String) -> String {
         node.utf8_text(source.as_bytes()).unwrap().to_string()
     }
+
+    pub fn as_boolean(node: &Node, source: &String) -> bool {
+        NodeFuncs::as_string(node, source).to_uppercase().eq( "TRUE")
+    }
 }
 impl CassandraStatement {
     pub fn from_tree(tree: &Tree, source: &String) -> CassandraStatement {
@@ -658,21 +732,21 @@ impl CassandraStatement {
         match node.kind() {
             "alter_keyspace" => CassandraStatement::AlterKeyspace,
             "alter_materialized_view" => CassandraStatement::AlterMaterializedView,
-            "alter_role" => CassandraStatement::AlterRole,
+            "alter_role" => CassandraStatement::AlterRole( CassandraParser::parse_role_data(node, source)),
             "alter_table" => CassandraStatement::AlterTable,
             "alter_type" => CassandraStatement::AlterType,
-            "alter_user" => CassandraStatement::AlterUser,
+            "alter_user" => CassandraStatement::AlterUser( CassandraParser::parse_user_data( node, source)),
             "apply_batch" => CassandraStatement::ApplyBatch,
             "create_aggregate" => CassandraStatement::CreateAggregate,
             "create_function" => CassandraStatement::CreateFunction,
             "create_index" => CassandraStatement::CreateIndex,
             "create_keyspace" => CassandraStatement::CreateKeyspace,
             "create_materialized_view" => CassandraStatement::CreateMaterializedView,
-            "create_role" => CassandraStatement::CreateRole,
+            "create_role" => CassandraStatement::CreateRole( CassandraParser::parse_role_data(node, source)),
             "create_table" => CassandraStatement::CreateTable,
             "create_trigger" => CassandraStatement::CreateTrigger,
             "create_type" => CassandraStatement::CreateType,
-            "create_user" => CassandraStatement::CreateUser,
+            "create_user" => CassandraStatement::CreateUser( CassandraParser::parse_user_data( node, source)),
             "delete_statement" => CassandraStatement::DeleteStatement(
                 CassandraParser::build_delete_statement(node, source),
             ),
@@ -726,7 +800,10 @@ impl CassandraStatement {
                     source,
                 ))
             }
-            "update" => CassandraStatement::Update,
+            "update" => CassandraStatement::Update(CassandraParser::build_update_statement(
+                node,
+                source,
+            )),
             "use" => {
                 let mut cursor = node.walk();
                 cursor.goto_first_child();
@@ -746,6 +823,131 @@ impl CassandraStatement {
 
 struct CassandraParser {}
 impl CassandraParser {
+
+    fn parse_role_data(node: &Node, source :&String) -> RoleData {
+        let mut cursor = node.walk();
+        let mut if_not_exists = false;
+        cursor.goto_first_child();
+        // consume 'ALTER/CREATE'
+        cursor.goto_next_sibling();
+        // consume 'ROLE'
+        cursor.goto_next_sibling();
+        if cursor.node().kind().eq("IF") {
+            // consume 'IF'
+            cursor.goto_next_sibling();
+            // consume 'NOT'
+            cursor.goto_next_sibling();
+            // consume 'EXISTS'
+            cursor.goto_next_sibling();
+            if_not_exists = true;
+        }
+        let mut result = RoleData {
+            name : NodeFuncs::as_string(&cursor.node(), source),
+            password: None,
+            superuser: None,
+            login: None,
+            options: vec![],
+            if_not_exists,
+        };
+        cursor.goto_next_sibling();
+        if cursor.node().kind().eq("role_with") {
+            cursor.goto_first_child();
+            // consume "WITH"
+            while cursor.goto_next_sibling() {
+                match cursor.node().kind() {
+                    "role_with_option" => {
+                        cursor.goto_first_child();
+                        match cursor.node().kind() {
+                            "PASSWORD" => {
+                                cursor.goto_next_sibling();
+                                // consume the '='
+                                cursor.goto_next_sibling();
+                                result.password = Some( NodeFuncs::as_string( &cursor.node(), source ));
+                                cursor.goto_next_sibling();
+                            },
+                            "LOGIN" => {cursor.goto_next_sibling();
+                                // consume the '='
+                                cursor.goto_next_sibling();
+                                result.login = Some( NodeFuncs::as_boolean( &cursor.node(), source ));
+                                cursor.goto_next_sibling();},
+                            "SUPERUSER" => {cursor.goto_next_sibling();
+                                // consume the '='
+                                cursor.goto_next_sibling();
+                                let kind = cursor.node().kind();
+                                result.superuser = Some( NodeFuncs::as_boolean( &cursor.node(), source ));
+                                cursor.goto_next_sibling();},
+                            "OPTIONS" => {
+                            cursor.goto_next_sibling();
+                            // consume the '='
+                            cursor.goto_next_sibling();
+                                let kind = cursor.node().kind();
+                            result.options = CassandraParser::parse_option_hash( &cursor.node(), source );
+                            cursor.goto_next_sibling();
+                            },
+                            _ => unreachable!(),
+                        }
+                        cursor.goto_parent();
+                    },
+                    _ => {}
+                }
+            }
+        }
+        result
+    }
+
+    fn parse_user_data(node: &Node, source :&String) -> UserData {
+        let mut cursor = node.walk();
+        let mut if_not_exists = false;
+        cursor.goto_first_child();
+        // consume 'ALTER/CREATE'
+        cursor.goto_next_sibling();
+        // consume 'USER'
+        cursor.goto_next_sibling();
+        if cursor.node().kind().eq("IF") {
+            // consume 'IF'
+            cursor.goto_next_sibling();
+            // consume 'NOT'
+            cursor.goto_next_sibling();
+            // consume 'EXISTS'
+            cursor.goto_next_sibling();
+            if_not_exists = true;
+        }
+
+        let mut result = UserData {
+            name : NodeFuncs::as_string(&cursor.node(), source),
+            password: None,
+            superuser: false,
+            no_superuser: false,
+            if_not_exists,
+        };
+        cursor.goto_next_sibling();
+        if cursor.node().kind().eq("user_with") {
+            cursor.goto_first_child();
+            // consume "WITH"
+            while cursor.goto_next_sibling() {
+                match cursor.node().kind() {
+                    "user_password" => {
+                        cursor.goto_first_child();
+                        // consumer "PASSWORD"
+                        cursor.goto_next_sibling();
+                        result.password = Some(NodeFuncs::as_string( &cursor.node(), source ));
+                        cursor.goto_parent();
+                    },
+                    "user_super_user" => {
+                        cursor.goto_first_child();
+                        match cursor.node().kind() {
+                            "SUPERUSER" => result.superuser=true,
+                            "NOSUPERUSER" => result.no_superuser=true,
+                            _ => unreachable!()
+                        }
+                    },
+                    _ => unreachable!()
+                }
+            }
+        }
+        result
+    }
+
     pub fn build_update_statement(node: &Node, source: &String) -> UpdateStatementData {
         /*
          optional( $.begin_batch),
@@ -786,7 +988,7 @@ impl CassandraParser {
                         Some(CassandraParser::parse_ttl_timestamp(&cursor.node(), source));
                 }
                 "assignment_element" => {
-                    statement_data.assignments.push(CassandraParser::parse_assignment_statement(&cursor.node(), source) );
+                    statement_data.assignments.push(CassandraParser::parse_assignment_element(&cursor.node(), source) );
                 }
                 "where_spec" => {
                     statement_data.where_clause =
@@ -816,7 +1018,6 @@ impl CassandraParser {
         let mut cursor = node.walk();
         cursor.goto_first_child();
         let name =  CassandraParser::parse_indexed_column( &mut cursor, source );
-        cursor.goto_next_sibling();
         // consume the '='
         cursor.goto_next_sibling();
         let value = CassandraParser::parse_operand( &cursor.node(), source);
@@ -945,7 +1146,7 @@ impl CassandraParser {
     fn parse_delete_column_item(node: &Node, source: &String) -> IndexedColumn {
         let mut cursor = node.walk();
         cursor.goto_first_child();
-        CassandraParser::parse_indexed_column(&mut cursor, String)
+        CassandraParser::parse_indexed_column(&mut cursor, source)
     }
 
 
@@ -953,10 +1154,13 @@ impl CassandraParser {
         IndexedColumn {
             column: NodeFuncs::as_string(&cursor.node(), &source),
 
-            value: if cursor.goto_next_sibling() {
+            value: if cursor.goto_next_sibling() && cursor.node().kind().eq("[") {
                 // consume '['
                 cursor.goto_next_sibling();
-                Some(NodeFuncs::as_string(&cursor.node(), &source))
+                let result = Some(NodeFuncs::as_string(&cursor.node(), &source));
+                // consume ']'
+                cursor.goto_next_sibling();
+                result
             } else {
                 None
             },
@@ -1182,12 +1386,44 @@ impl CassandraParser {
         }
     }
 
+    fn parse_option_hash(node: &Node, source: &String) -> Vec<(String, String)> {
+        /*
+               option_hash : $ => seq( "{", commaSep1( $.option_hash_item), "}"),
+        option_hash_item : $ => seq( alias($._string_literal,"property"), ":", alias( choice( $._string_literal, $._float_literal), "value"), ),
+
+         */
+        let mut cursor = node.walk();
+
+        cursor.goto_first_child();
+        let mut entries: Vec<(String, String)> = vec![];
+        // { const : const, ... }
+        // we are on the '{' so we can just skip it
+        while cursor.goto_next_sibling() {
+            match cursor.node().kind() {
+                "}" | "," => {}
+                "option_hash_item" => {
+                    cursor.goto_first_child();
+                    let key = NodeFuncs::as_string(&cursor.node(), &source);
+                    cursor.goto_next_sibling();
+                    // consume the ':'
+                    cursor.goto_next_sibling();
+                    let value = NodeFuncs::as_string(&cursor.node(), &source);
+                    entries.push((key, value));
+                    cursor.goto_parent();
+                }
+                _ => unreachable!(),
+            }
+        }
+        cursor.goto_parent();
+        entries
+    }
+
     fn parse_assignment_map(node: &Node, source: &String) -> Vec<(String, String)> {
         let mut cursor = node.walk();
         cursor.goto_first_child();
-        // { const : const, ... }
         let mut entries: Vec<(String, String)> = vec![];
         cursor.goto_first_child();
+        // { const : const, ... }
         // we are on the '{' so we can just skip it
         while cursor.goto_next_sibling() {
             match cursor.node().kind() {
@@ -1202,6 +1438,7 @@ impl CassandraParser {
                 }
             }
         }
+        cursor.goto_parent();
         entries
     }
 
@@ -1573,21 +1810,21 @@ impl ToString for CassandraStatement {
         match self {
             CassandraStatement::AlterKeyspace => unimplemented,
             CassandraStatement::AlterMaterializedView => unimplemented,
-            CassandraStatement::AlterRole => unimplemented,
+            CassandraStatement::AlterRole(role_data) => format!( "ALTER ROLE {}", role_data ),
             CassandraStatement::AlterTable => unimplemented,
             CassandraStatement::AlterType => unimplemented,
-            CassandraStatement::AlterUser => unimplemented,
+            CassandraStatement::AlterUser(user_data) => format!( "ALTER USER {}", user_data ),
             CassandraStatement::ApplyBatch => String::from("APPLY BATCH"),
             CassandraStatement::CreateAggregate => unimplemented,
             CassandraStatement::CreateFunction => unimplemented,
             CassandraStatement::CreateIndex => unimplemented,
             CassandraStatement::CreateKeyspace => unimplemented,
             CassandraStatement::CreateMaterializedView => unimplemented,
-            CassandraStatement::CreateRole => unimplemented,
+            CassandraStatement::CreateRole(role_data) => format!( "CREATE ROLE {}", role_data ),
             CassandraStatement::CreateTable => unimplemented,
             CassandraStatement::CreateTrigger => unimplemented,
             CassandraStatement::CreateType => unimplemented,
-            CassandraStatement::CreateUser => unimplemented,
+            CassandraStatement::CreateUser(user_data) => format!( "CREATE USER {}", user_data ),
             CassandraStatement::DeleteStatement(statement_data) => statement_data.to_string(),
             CassandraStatement::DropAggregate(drop_data) => drop_data.get_text("AGGREGATE"),
             CassandraStatement::DropFunction(drop_data) => drop_data.get_text("FUNCTION"),
@@ -1856,7 +2093,7 @@ mod tests {
 
     #[test]
     fn x() {
-        let qry = "SELECT foo FROM myTable WHERE bfCol1 <> 'bar' and filterColumn = 0X02000000000020000000000000000080";
+        let qry = "ALTER ROLE 'role' WITH PASSWORD = 'password'";
         let ast = CassandraAST::new(qry.to_string());
         let stmt = ast.statement;
         let stmt_str = stmt.to_string();
@@ -1868,52 +2105,42 @@ mod tests {
         let stmts = [
             "ALTER KEYSPACE keyspace WITH REPLICATION = { 'foo' : 'bar', 'baz' : 5};",
             "ALTER MATERIALIZED VIEW 'keyspace'.mview;",
-            "ALTER ROLE 'role' WITH PASSWORD = 'password';",
             "ALTER TABLE keyspace.table DROP column1, column2;",
             "ALTER TYPE type ALTER column TYPE UUID;",
-            "ALTER USER username WITH PASSWORD 'password' superuser;",
             "APPLY BATCH;",
             "CREATE AGGREGATE keyspace.aggregate  ( ASCII ) SFUNC sfunc STYPE BIGINT FINALFUNC finalFunc INITCOND (( 5, 'text', 6.3),(4,'foo',3.14));",
             "CREATE FUNCTION IF NOT EXISTS func ( param1 int , param2 text) CALLED ON NULL INPUT RETURNS INT LANGUAGE javascript AS $$ return 5; $$;",
             "CREATE INDEX index_name ON keyspace.table (column);",
             "CREATE KEYSPACE keyspace WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 1  };",
             "CREATE MATERIALIZED VIEW keyspace.view AS SELECT col1, col2 FROM ks_target.tbl_target WHERE col3 IS NOT NULL AND col4 IS NOT NULL AND col5 <> 'foo' PRIMARY KEY (col1) WITH option1 = 'option' AND option2 = 3.5 AND CLUSTERING ORDER BY (col2 DESC);",
-            "CREATE ROLE role WITH OPTIONS = { 'option1' : 'value', 'option2' : 4.5 };",
             "CREATE TABLE table (col1 text, col2 int, col3 FROZEN<col4>, PRIMARY KEY (col1, col2) ) WITH option = 'option' AND option2 = 3.5;",
             "CREATE TRIGGER if not exists keyspace.trigger_name USING 'trigger_class';",
             "CREATE TYPE type ( col1 'foo');",
-            "CREATE USER newuser WITH PASSWORD 'password';",
             "DROP TRIGGER trigger_name ON ks.table_name;",
             "GRANT ALL ON 'keyspace'.table TO role;",
             "LIST ALL;",
             "LIST ROLES;",
             "REVOKE ALL ON ALL ROLES FROM role;",
-            "UPDATE keyspace.table USING TIMESTAMP 3 SET col1 = 'foo' WHERE col2=5;",
             "Not a valid statement"];
         let types = [
             CassandraStatement::AlterKeyspace,
             CassandraStatement::AlterMaterializedView,
-            CassandraStatement::AlterRole,
             CassandraStatement::AlterTable,
             CassandraStatement::AlterType,
-            CassandraStatement::AlterUser,
             CassandraStatement::ApplyBatch,
             CassandraStatement::CreateAggregate,
             CassandraStatement::CreateFunction,
             CassandraStatement::CreateIndex,
             CassandraStatement::CreateKeyspace,
             CassandraStatement::CreateMaterializedView,
-            CassandraStatement::CreateRole,
             CassandraStatement::CreateTable,
             CassandraStatement::CreateTrigger,
             CassandraStatement::CreateType,
-            CassandraStatement::CreateUser,
             CassandraStatement::DropTrigger,
             CassandraStatement::Grant,
             CassandraStatement::ListPermissions,
             CassandraStatement::ListRoles,
             CassandraStatement::Revoke,
-            CassandraStatement::Update,
             CassandraStatement::UNKNOWN("Not a valid statement".to_string()),
         ];
 
@@ -2080,4 +2307,115 @@ mod tests {
         let expected = ["DROP USER user", "DROP USER IF EXISTS user"];
         test_parsing(&expected, &stmts);
     }
+
+    #[test]
+    fn test_update_statements() {
+        let stmts = [
+            "BEGIN LOGGED BATCH USING TIMESTAMP 5 UPDATE keyspace.table SET col1 = 'foo' WHERE col2=5;",
+            "UPDATE keyspace.table USING TIMESTAMP 3 SET col1 = 'foo' WHERE col2=5;",
+            "UPDATE keyspace.table SET col1 = 'foo' WHERE col2=5 IF EXISTS;",
+            "UPDATE keyspace.table SET col1 = 'foo' WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = { 5 : 'hello', 'world' : 5b6962dd-3f90-4c93-8f61-eabfa4a803e2 } WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = {  'hello',  5b6962dd-3f90-4c93-8f61-eabfa4a803e2 } WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = [  'hello',  5b6962dd-3f90-4c93-8f61-eabfa4a803e2 ] WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = col2+5 WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = col2+{ 5 : 'hello', 'world' : 5b6962dd-3f90-4c93-8f61-eabfa4a803e2 } WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = { 5 : 'hello', 'world' : 5b6962dd-3f90-4c93-8f61-eabfa4a803e2 } - col2 WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = col2 + {  'hello',  5b6962dd-3f90-4c93-8f61-eabfa4a803e2 }  WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = {  'hello',  5b6962dd-3f90-4c93-8f61-eabfa4a803e2 } - col2 WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = col2+[  'hello',  5b6962dd-3f90-4c93-8f61-eabfa4a803e2 ] WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1 = [  'hello',  5b6962dd-3f90-4c93-8f61-eabfa4a803e2 ]+col2 WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table SET col1[5] = 'hello' WHERE col2=5 IF col3=7;",
+            "UPDATE keyspace.table USING TIMESTAMP 3 SET col1 = 'foo' WHERE col2=5;"
+        ];
+        let expected = [
+            "BEGIN LOGGED BATCH USING TIMESTAMP 5 UPDATE keyspace.table SET col1 = 'foo' WHERE col2 = 5",
+            "UPDATE keyspace.table USING TIMESTAMP 3 SET col1 = 'foo' WHERE col2 = 5",
+            "UPDATE keyspace.table SET col1 = 'foo' WHERE col2 = 5 IF EXISTS",
+            "UPDATE keyspace.table SET col1 = 'foo' WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = {5:'hello', 'world':5b6962dd-3f90-4c93-8f61-eabfa4a803e2} WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = {'hello', 5b6962dd-3f90-4c93-8f61-eabfa4a803e2} WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = ['hello', 5b6962dd-3f90-4c93-8f61-eabfa4a803e2] WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = col2 + 5 WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = col2 + {5:'hello', 'world':5b6962dd-3f90-4c93-8f61-eabfa4a803e2} WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = {5:'hello', 'world':5b6962dd-3f90-4c93-8f61-eabfa4a803e2} - col2 WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = col2 + {'hello', 5b6962dd-3f90-4c93-8f61-eabfa4a803e2} WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = {'hello', 5b6962dd-3f90-4c93-8f61-eabfa4a803e2} - col2 WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = col2 + ['hello', 5b6962dd-3f90-4c93-8f61-eabfa4a803e2] WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1 = ['hello', 5b6962dd-3f90-4c93-8f61-eabfa4a803e2] + col2 WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table SET col1[5] = 'hello' WHERE col2 = 5 IF col3 = 7",
+            "UPDATE keyspace.table USING TIMESTAMP 3 SET col1 = 'foo' WHERE col2 = 5"
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_create_role() {
+        let stmts = [
+            "CREATE ROLE if not exists role;",
+            "CREATE ROLE 'role'",
+            "CREATE ROLE 'role' WITH PASSWORD = 'password'",
+            "CREATE ROLE 'role' WITH PASSWORD = 'password' AND LOGIN=false;",
+            "CREATE ROLE 'role' WITH SUPERUSER=true;",
+            "CREATE ROLE 'role' WITH OPTIONS={ 'foo' : 3.14, 'bar' : 'pi' }",
+        ];
+        let expected = [
+            "CREATE ROLE IF NOT EXISTS role",
+            "CREATE ROLE 'role'",
+            "CREATE ROLE 'role' WITH PASSWORD = 'password'",
+            "CREATE ROLE 'role' WITH PASSWORD = 'password' AND LOGIN = FALSE",
+            "CREATE ROLE 'role' WITH SUPERUSER = TRUE",
+            "CREATE ROLE 'role' WITH OPTIONS = {'foo':3.14, 'bar':'pi'}",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_alter_role() {
+        let stmts = [
+            "ALTER ROLE 'role'",
+            "ALTER ROLE 'role' WITH PASSWORD = 'password';",
+            "ALTER ROLE 'role' WITH PASSWORD = 'password' AND LOGIN=false;",
+            "ALTER ROLE 'role' WITH SUPERUSER=true;",
+            "ALTER ROLE 'role' WITH OPTIONS={ 'foo' : 3.14, 'bar' : 'pi' }",
+        ];
+        let expected = [
+            "ALTER ROLE 'role'",
+            "ALTER ROLE 'role' WITH PASSWORD = 'password'",
+            "ALTER ROLE 'role' WITH PASSWORD = 'password' AND LOGIN = FALSE",
+            "ALTER ROLE 'role' WITH SUPERUSER = TRUE",
+            "ALTER ROLE 'role' WITH OPTIONS = {'foo':3.14, 'bar':'pi'}",
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
+    #[test]
+    fn test_create_user() {
+        let stmts = [
+            "CREATE USER if not exists username WITH PASSWORD 'password';",
+            "CREATE USER username WITH PASSWORD 'password' superuser;",
+            "CREATE USER username WITH PASSWORD 'password' nosuperuser;"
+        ];
+        let expected = [
+            "CREATE USER IF NOT EXISTS username WITH PASSWORD 'password'",
+            "CREATE USER username WITH PASSWORD 'password' SUPERUSER",
+            "CREATE USER username WITH PASSWORD 'password' NOSUPERUSER"
+        ];
+        test_parsing(&expected, &stmts);
+    }
+    #[test]
+    fn test_alter_user() {
+        let stmts = [
+            "ALTER USER username WITH PASSWORD 'password';",
+            "ALTER USER username WITH PASSWORD 'password' superuser;",
+            "ALTER USER username WITH PASSWORD 'password' nosuperuser;"
+        ];
+        let expected = [
+            "ALTER USER username WITH PASSWORD 'password'",
+            "ALTER USER username WITH PASSWORD 'password' SUPERUSER",
+            "ALTER USER username WITH PASSWORD 'password' NOSUPERUSER"
+        ];
+        test_parsing(&expected, &stmts);
+    }
+
 }
