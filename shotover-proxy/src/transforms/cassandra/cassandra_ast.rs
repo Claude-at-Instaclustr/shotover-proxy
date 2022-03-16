@@ -1,12 +1,8 @@
 use itertools::Itertools;
-use pktparse::arp::Operation;
 use regex::Regex;
-use std::borrow::Borrow;
 use std::fmt::{Display, Formatter};
-use std::ops::Deref;
-use cassandra_protocol::types::from_cursor_string_list;
 use tree_sitter::{
-    Language, LogType, Node, Parser, Query, QueryCapture, QueryCursor, QueryMatch, Tree, TreeCursor,
+    Node, Tree, TreeCursor,
 };
 
 #[derive(PartialEq, Debug, Clone)]
@@ -68,20 +64,21 @@ impl ToString for UpdateStatementData {
         if self.begin_batch.is_some() {
             result.push_str(self.begin_batch.as_ref().unwrap().to_string().as_str());
         }
-        result.push_str( "UPDATE ");
+        result.push_str("UPDATE ");
         result.push_str(self.table_name.as_str());
         if self.using_ttl.is_some() {
-            result.push_str( self.using_ttl.as_ref().unwrap().to_string().as_str());
+            result.push_str(self.using_ttl.as_ref().unwrap().to_string().as_str());
         }
-        result.push_str( " SET ");
-        result.push_str( self.assignments.iter().map( |a| a.to_string()).join(",").as_str() );
-        result.push_str(" WHERE ");
+        result.push_str(" SET ");
         result.push_str(
-            self.where_clause
+            self.assignments
                 .iter()
-                .join(" AND ")
+                .map(|a| a.to_string())
+                .join(",")
                 .as_str(),
         );
+        result.push_str(" WHERE ");
+        result.push_str(self.where_clause.iter().join(" AND ").as_str());
         if self.if_spec.is_some() {
             result.push_str(" IF ");
             result.push_str(
@@ -102,9 +99,9 @@ impl ToString for UpdateStatementData {
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct AssignmentElement {
-    pub name : IndexedColumn,
-    pub value : Operand,
-    pub operator : Option<AssignmentOperator>,
+    pub name: IndexedColumn,
+    pub value: Operand,
+    pub operator: Option<AssignmentOperator>,
 }
 
 impl Display for AssignmentElement {
@@ -125,8 +122,8 @@ pub enum AssignmentOperator {
 impl Display for AssignmentOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            AssignmentOperator::Plus(op) => write!( f, " + {}", op),
-            AssignmentOperator::Minus(op) => write!( f, " - {}", op),
+            AssignmentOperator::Plus(op) => write!(f, " + {}", op),
+            AssignmentOperator::Minus(op) => write!(f, " - {}", op),
         }
     }
 }
@@ -155,7 +152,6 @@ pub struct DeleteStatementData {
     pub timestamp: Option<u64>,
     pub where_clause: Vec<RelationElement>,
     pub if_spec: Option<Vec<(String, String)>>,
-
 }
 
 impl ToString for DeleteStatementData {
@@ -564,16 +560,17 @@ pub enum RelationOperator {
 }
 
 impl RelationOperator {
-    pub fn eval<T>( &self, left: &T, right : &T )-> bool
-    where T : PartialOrd
-         {
+    pub fn eval<T>(&self, left: &T, right: &T) -> bool
+    where
+        T: PartialOrd,
+    {
         match self {
             RelationOperator::LT => left.lt(right),
-            RelationOperator::LE => left.le( right ),
-            RelationOperator::EQ => left.eq( right ),
-            RelationOperator::NE => ! left.eq( right ),
-            RelationOperator::GE => left.ge( right ),
-            RelationOperator::GT => left.gt( right ),
+            RelationOperator::LE => left.le(right),
+            RelationOperator::EQ => left.eq(right),
+            RelationOperator::NE => !left.eq(right),
+            RelationOperator::GE => left.ge(right),
+            RelationOperator::GT => left.gt(right),
             RelationOperator::IN => false,
             RelationOperator::CONTAINS => false,
             RelationOperator::CONTAINS_KEY => false,
@@ -626,33 +623,68 @@ pub struct RoleData {
     password: Option<String>,
     superuser: Option<bool>,
     login: Option<bool>,
-    options: Vec<(String,String)>,
-    if_not_exists : bool,
+    options: Vec<(String, String)>,
+    if_not_exists: bool,
 }
 
 impl Display for RoleData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut with = vec!();
+        let mut with = vec![];
 
         if self.password.is_some() {
-            with.push( format!("PASSWORD = {}",self.password.as_ref().unwrap() ));
+            with.push(format!("PASSWORD = {}", self.password.as_ref().unwrap()));
         }
         if self.superuser.is_some() {
-            with.push( format!("SUPERUSER = {}",if self.superuser.unwrap() { "TRUE" } else { "FALSE" }));
+            with.push(format!(
+                "SUPERUSER = {}",
+                if self.superuser.unwrap() {
+                    "TRUE"
+                } else {
+                    "FALSE"
+                }
+            ));
         }
         if self.login.is_some() {
-            with.push( format!("LOGIN = {}",if self.login.unwrap() { "TRUE" } else { "FALSE" }));
+            with.push(format!(
+                "LOGIN = {}",
+                if self.login.unwrap() { "TRUE" } else { "FALSE" }
+            ));
         }
         if !self.options.is_empty() {
             let mut txt = "OPTIONS = {".to_string();
-            txt.push_str(self.options.iter().map(|(x, y)| format!("{}:{}", x, y)).join(", ").as_str());
+            txt.push_str(
+                self.options
+                    .iter()
+                    .map(|(x, y)| format!("{}:{}", x, y))
+                    .join(", ")
+                    .as_str(),
+            );
             txt.push('}');
-            with.push( txt.to_string() );
+            with.push(txt.to_string());
         }
         if with.is_empty() {
-            write!(f, "{}{}", if self.if_not_exists{ "IF NOT EXISTS " }else{""},self.name )
+            write!(
+                f,
+                "{}{}",
+                if self.if_not_exists {
+                    "IF NOT EXISTS "
+                } else {
+                    ""
+                },
+                self.name
+            )
         } else {
-            write!(f, "{}{} WITH {}", if self.if_not_exists{ "IF NOT EXISTS " }else{""},self.name, with.iter().join(" AND "))
+            write!(
+                f,
+                "{}{} WITH {}",
+                if self.if_not_exists {
+                    "IF NOT EXISTS "
+                } else {
+                    ""
+                },
+                self.name,
+                with.iter().join(" AND ")
+            )
         }
     }
 }
@@ -662,7 +694,7 @@ pub struct UserData {
     name: String,
     password: Option<String>,
     superuser: bool,
-    no_superuser:bool,
+    no_superuser: bool,
     if_not_exists: bool,
 }
 
@@ -670,20 +702,39 @@ impl Display for UserData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut with = String::new();
 
-            if self.password.is_some() {
-                with.push_str( " PASSWORD " );
-                with.push_str( self.password.as_ref().unwrap().as_str());
-            }
-            if self.superuser {
-                with.push_str( " SUPERUSER");
-            }
-            if self.no_superuser {
-                with.push_str(" NOSUPERUSER");
-            }
+        if self.password.is_some() {
+            with.push_str(" PASSWORD ");
+            with.push_str(self.password.as_ref().unwrap().as_str());
+        }
+        if self.superuser {
+            with.push_str(" SUPERUSER");
+        }
+        if self.no_superuser {
+            with.push_str(" NOSUPERUSER");
+        }
         if with.is_empty() {
-            write!(f, "{}{}", if self.if_not_exists {"IF NOT EXISTS "}else{""}, self.name)
+            write!(
+                f,
+                "{}{}",
+                if self.if_not_exists {
+                    "IF NOT EXISTS "
+                } else {
+                    ""
+                },
+                self.name
+            )
         } else {
-            write!(f, "{}{} WITH{}", if self.if_not_exists {"IF NOT EXISTS "}else{""},self.name, with)
+            write!(
+                f,
+                "{}{} WITH{}",
+                if self.if_not_exists {
+                    "IF NOT EXISTS "
+                } else {
+                    ""
+                },
+                self.name,
+                with
+            )
         }
     }
 }
@@ -713,7 +764,7 @@ impl NodeFuncs {
     }
 
     pub fn as_boolean(node: &Node, source: &String) -> bool {
-        NodeFuncs::as_string(node, source).to_uppercase().eq( "TRUE")
+        NodeFuncs::as_string(node, source).to_uppercase().eq("TRUE")
     }
 }
 impl CassandraStatement {
@@ -732,21 +783,29 @@ impl CassandraStatement {
         match node.kind() {
             "alter_keyspace" => CassandraStatement::AlterKeyspace,
             "alter_materialized_view" => CassandraStatement::AlterMaterializedView,
-            "alter_role" => CassandraStatement::AlterRole( CassandraParser::parse_role_data(node, source)),
+            "alter_role" => {
+                CassandraStatement::AlterRole(CassandraParser::parse_role_data(node, source))
+            }
             "alter_table" => CassandraStatement::AlterTable,
             "alter_type" => CassandraStatement::AlterType,
-            "alter_user" => CassandraStatement::AlterUser( CassandraParser::parse_user_data( node, source)),
+            "alter_user" => {
+                CassandraStatement::AlterUser(CassandraParser::parse_user_data(node, source))
+            }
             "apply_batch" => CassandraStatement::ApplyBatch,
             "create_aggregate" => CassandraStatement::CreateAggregate,
             "create_function" => CassandraStatement::CreateFunction,
             "create_index" => CassandraStatement::CreateIndex,
             "create_keyspace" => CassandraStatement::CreateKeyspace,
             "create_materialized_view" => CassandraStatement::CreateMaterializedView,
-            "create_role" => CassandraStatement::CreateRole( CassandraParser::parse_role_data(node, source)),
+            "create_role" => {
+                CassandraStatement::CreateRole(CassandraParser::parse_role_data(node, source))
+            }
             "create_table" => CassandraStatement::CreateTable,
             "create_trigger" => CassandraStatement::CreateTrigger,
             "create_type" => CassandraStatement::CreateType,
-            "create_user" => CassandraStatement::CreateUser( CassandraParser::parse_user_data( node, source)),
+            "create_user" => {
+                CassandraStatement::CreateUser(CassandraParser::parse_user_data(node, source))
+            }
             "delete_statement" => CassandraStatement::DeleteStatement(
                 CassandraParser::build_delete_statement(node, source),
             ),
@@ -800,10 +859,9 @@ impl CassandraStatement {
                     source,
                 ))
             }
-            "update" => CassandraStatement::Update(CassandraParser::build_update_statement(
-                node,
-                source,
-            )),
+            "update" => {
+                CassandraStatement::Update(CassandraParser::build_update_statement(node, source))
+            }
             "use" => {
                 let mut cursor = node.walk();
                 cursor.goto_first_child();
@@ -823,8 +881,7 @@ impl CassandraStatement {
 
 struct CassandraParser {}
 impl CassandraParser {
-
-    fn parse_role_data(node: &Node, source :&String) -> RoleData {
+    fn parse_role_data(node: &Node, source: &String) -> RoleData {
         let mut cursor = node.walk();
         let mut if_not_exists = false;
         cursor.goto_first_child();
@@ -842,7 +899,7 @@ impl CassandraParser {
             if_not_exists = true;
         }
         let mut result = RoleData {
-            name : NodeFuncs::as_string(&cursor.node(), source),
+            name: NodeFuncs::as_string(&cursor.node(), source),
             password: None,
             superuser: None,
             login: None,
@@ -862,32 +919,37 @@ impl CassandraParser {
                                 cursor.goto_next_sibling();
                                 // consume the '='
                                 cursor.goto_next_sibling();
-                                result.password = Some( NodeFuncs::as_string( &cursor.node(), source ));
+                                result.password =
+                                    Some(NodeFuncs::as_string(&cursor.node(), source));
                                 cursor.goto_next_sibling();
-                            },
-                            "LOGIN" => {cursor.goto_next_sibling();
+                            }
+                            "LOGIN" => {
+                                cursor.goto_next_sibling();
                                 // consume the '='
                                 cursor.goto_next_sibling();
-                                result.login = Some( NodeFuncs::as_boolean( &cursor.node(), source ));
-                                cursor.goto_next_sibling();},
-                            "SUPERUSER" => {cursor.goto_next_sibling();
+                                result.login = Some(NodeFuncs::as_boolean(&cursor.node(), source));
+                                cursor.goto_next_sibling();
+                            }
+                            "SUPERUSER" => {
+                                cursor.goto_next_sibling();
                                 // consume the '='
                                 cursor.goto_next_sibling();
-                                let kind = cursor.node().kind();
-                                result.superuser = Some( NodeFuncs::as_boolean( &cursor.node(), source ));
-                                cursor.goto_next_sibling();},
+                                result.superuser =
+                                    Some(NodeFuncs::as_boolean(&cursor.node(), source));
+                                cursor.goto_next_sibling();
+                            }
                             "OPTIONS" => {
-                            cursor.goto_next_sibling();
-                            // consume the '='
-                            cursor.goto_next_sibling();
-                                let kind = cursor.node().kind();
-                            result.options = CassandraParser::parse_option_hash( &cursor.node(), source );
-                            cursor.goto_next_sibling();
-                            },
+                                cursor.goto_next_sibling();
+                                // consume the '='
+                                cursor.goto_next_sibling();
+                                result.options =
+                                    CassandraParser::parse_option_hash(&cursor.node(), source);
+                                cursor.goto_next_sibling();
+                            }
                             _ => unreachable!(),
                         }
                         cursor.goto_parent();
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -895,7 +957,7 @@ impl CassandraParser {
         result
     }
 
-    fn parse_user_data(node: &Node, source :&String) -> UserData {
+    fn parse_user_data(node: &Node, source: &String) -> UserData {
         let mut cursor = node.walk();
         let mut if_not_exists = false;
         cursor.goto_first_child();
@@ -914,7 +976,7 @@ impl CassandraParser {
         }
 
         let mut result = UserData {
-            name : NodeFuncs::as_string(&cursor.node(), source),
+            name: NodeFuncs::as_string(&cursor.node(), source),
             password: None,
             superuser: false,
             no_superuser: false,
@@ -930,18 +992,18 @@ impl CassandraParser {
                         cursor.goto_first_child();
                         // consumer "PASSWORD"
                         cursor.goto_next_sibling();
-                        result.password = Some(NodeFuncs::as_string( &cursor.node(), source ));
+                        result.password = Some(NodeFuncs::as_string(&cursor.node(), source));
                         cursor.goto_parent();
-                    },
+                    }
                     "user_super_user" => {
                         cursor.goto_first_child();
                         match cursor.node().kind() {
-                            "SUPERUSER" => result.superuser=true,
-                            "NOSUPERUSER" => result.no_superuser=true,
-                            _ => unreachable!()
+                            "SUPERUSER" => result.superuser = true,
+                            "NOSUPERUSER" => result.no_superuser = true,
+                            _ => unreachable!(),
                         }
-                    },
-                    _ => unreachable!()
+                    }
+                    _ => unreachable!(),
                 }
             }
         }
@@ -950,15 +1012,15 @@ impl CassandraParser {
 
     pub fn build_update_statement(node: &Node, source: &String) -> UpdateStatementData {
         /*
-         optional( $.begin_batch),
-                kw( "UPDATE"),
-                dotted_name( $.object_name, $.object_name, "table"),
-                optional( $.using_ttl_timestamp),
-                kw( "SET"),
-                commaSep1( $.assignment_element),
-                $.where_spec,
-                optional( choice( if_exists, $.if_spec))
-         */
+        optional( $.begin_batch),
+               kw( "UPDATE"),
+               dotted_name( $.object_name, $.object_name, "table"),
+               optional( $.using_ttl_timestamp),
+               kw( "SET"),
+               commaSep1( $.assignment_element),
+               $.where_spec,
+               optional( choice( if_exists, $.if_spec))
+        */
         let mut statement_data = UpdateStatementData {
             begin_batch: None,
             modifiers: StatementModifiers::new(),
@@ -966,29 +1028,33 @@ impl CassandraParser {
             using_ttl: None,
             assignments: vec![],
             where_clause: vec![],
-            if_spec: None
+            if_spec: None,
         };
         let mut cursor = node.walk();
         let mut process = cursor.goto_first_child();
 
         while process {
-            let mut node = cursor.node();
-            let mut kind = node.kind();
-            match kind {
+            match cursor.node().kind() {
                 "begin_batch" => {
                     statement_data.begin_batch =
                         Some(CassandraParser::parse_begin_batch(&cursor.node(), source))
                 }
                 "UPDATE" => {
                     cursor.goto_next_sibling();
-                    statement_data.table_name = CassandraParser::parse_dotted_name(&mut cursor, source);
+                    statement_data.table_name =
+                        CassandraParser::parse_dotted_name(&mut cursor, source);
                 }
                 "using_ttl_timestamp" => {
                     statement_data.using_ttl =
                         Some(CassandraParser::parse_ttl_timestamp(&cursor.node(), source));
                 }
                 "assignment_element" => {
-                    statement_data.assignments.push(CassandraParser::parse_assignment_element(&cursor.node(), source) );
+                    statement_data
+                        .assignments
+                        .push(CassandraParser::parse_assignment_element(
+                            &cursor.node(),
+                            source,
+                        ));
                 }
                 "where_spec" => {
                     statement_data.where_clause =
@@ -1014,17 +1080,17 @@ impl CassandraParser {
         statement_data
     }
 
-    fn parse_assignment_element(node : &Node, source : &String) -> AssignmentElement {
+    fn parse_assignment_element(node: &Node, source: &String) -> AssignmentElement {
         let mut cursor = node.walk();
         cursor.goto_first_child();
-        let name =  CassandraParser::parse_indexed_column( &mut cursor, source );
+        let name = CassandraParser::parse_indexed_column(&mut cursor, source);
         // consume the '='
         cursor.goto_next_sibling();
-        let value = CassandraParser::parse_operand( &cursor.node(), source);
-        let mut result  = AssignmentElement {
+        let value = CassandraParser::parse_operand(&cursor.node(), source);
+        let mut result = AssignmentElement {
             name,
             value,
-            operator: None
+            operator: None,
         };
         if cursor.goto_next_sibling() {
             // we have +/- value
@@ -1063,9 +1129,7 @@ impl CassandraParser {
         let mut process = cursor.goto_first_child();
 
         while process {
-            let mut node = cursor.node();
-            let mut kind = node.kind();
-            match kind {
+            match cursor.node().kind() {
                 "begin_batch" => {
                     statement_data.begin_batch =
                         Some(CassandraParser::parse_begin_batch(&cursor.node(), source))
@@ -1148,7 +1212,6 @@ impl CassandraParser {
         cursor.goto_first_child();
         CassandraParser::parse_indexed_column(&mut cursor, source)
     }
-
 
     fn parse_indexed_column(cursor: &mut TreeCursor, source: &String) -> IndexedColumn {
         IndexedColumn {
@@ -1357,8 +1420,7 @@ impl CassandraParser {
         let mut process = cursor.goto_first_child();
 
         while process {
-            let mut kind = cursor.node().kind();
-            if kind.eq("expression") {
+            if cursor.node().kind().eq("expression") {
                 cursor.goto_first_child();
                 result.push(CassandraParser::parse_operand(&cursor.node(), source));
                 cursor.goto_parent();
@@ -1494,7 +1556,7 @@ impl CassandraParser {
         // consume BEGIN
         cursor.goto_next_sibling();
 
-        let mut node = cursor.node();
+        let node = cursor.node();
         result.logged = node.kind().eq("LOGGED");
         result.unlogged = node.kind().eq("UNLOGGED");
         if result.logged || result.unlogged {
@@ -1663,7 +1725,7 @@ impl CassandraParser {
                         // consume the oper
                         cursor.goto_next_sibling();
                         let mut values = vec![];
-                        let mut inline_tuple = if cursor.node().kind().eq("(") {
+                        let inline_tuple = if cursor.node().kind().eq("(") {
                             // inline tuple or function_args
                             cursor.goto_next_sibling();
                             true
@@ -1810,21 +1872,21 @@ impl ToString for CassandraStatement {
         match self {
             CassandraStatement::AlterKeyspace => unimplemented,
             CassandraStatement::AlterMaterializedView => unimplemented,
-            CassandraStatement::AlterRole(role_data) => format!( "ALTER ROLE {}", role_data ),
+            CassandraStatement::AlterRole(role_data) => format!("ALTER ROLE {}", role_data),
             CassandraStatement::AlterTable => unimplemented,
             CassandraStatement::AlterType => unimplemented,
-            CassandraStatement::AlterUser(user_data) => format!( "ALTER USER {}", user_data ),
+            CassandraStatement::AlterUser(user_data) => format!("ALTER USER {}", user_data),
             CassandraStatement::ApplyBatch => String::from("APPLY BATCH"),
             CassandraStatement::CreateAggregate => unimplemented,
             CassandraStatement::CreateFunction => unimplemented,
             CassandraStatement::CreateIndex => unimplemented,
             CassandraStatement::CreateKeyspace => unimplemented,
             CassandraStatement::CreateMaterializedView => unimplemented,
-            CassandraStatement::CreateRole(role_data) => format!( "CREATE ROLE {}", role_data ),
+            CassandraStatement::CreateRole(role_data) => format!("CREATE ROLE {}", role_data),
             CassandraStatement::CreateTable => unimplemented,
             CassandraStatement::CreateTrigger => unimplemented,
             CassandraStatement::CreateType => unimplemented,
-            CassandraStatement::CreateUser(user_data) => format!( "CREATE USER {}", user_data ),
+            CassandraStatement::CreateUser(user_data) => format!("CREATE USER {}", user_data),
             CassandraStatement::DeleteStatement(statement_data) => statement_data.to_string(),
             CassandraStatement::DropAggregate(drop_data) => drop_data.get_text("AGGREGATE"),
             CassandraStatement::DropFunction(drop_data) => drop_data.get_text("FUNCTION"),
@@ -1943,10 +2005,8 @@ impl SearchPattern {
 #[cfg(test)]
 mod tests {
     use crate::transforms::cassandra::cassandra_ast::{
-        CassandraAST, CassandraStatement, Named, Operand, RelationOperator, SelectElement,
+        CassandraAST, CassandraStatement,
     };
-    use sqlparser::test_utils::table;
-    use tree_sitter::Node;
 
     fn test_parsing(expected: &[&str], statements: &[&str]) {
         for i in 0..statements.len() {
@@ -2394,12 +2454,12 @@ mod tests {
         let stmts = [
             "CREATE USER if not exists username WITH PASSWORD 'password';",
             "CREATE USER username WITH PASSWORD 'password' superuser;",
-            "CREATE USER username WITH PASSWORD 'password' nosuperuser;"
+            "CREATE USER username WITH PASSWORD 'password' nosuperuser;",
         ];
         let expected = [
             "CREATE USER IF NOT EXISTS username WITH PASSWORD 'password'",
             "CREATE USER username WITH PASSWORD 'password' SUPERUSER",
-            "CREATE USER username WITH PASSWORD 'password' NOSUPERUSER"
+            "CREATE USER username WITH PASSWORD 'password' NOSUPERUSER",
         ];
         test_parsing(&expected, &stmts);
     }
@@ -2408,14 +2468,13 @@ mod tests {
         let stmts = [
             "ALTER USER username WITH PASSWORD 'password';",
             "ALTER USER username WITH PASSWORD 'password' superuser;",
-            "ALTER USER username WITH PASSWORD 'password' nosuperuser;"
+            "ALTER USER username WITH PASSWORD 'password' nosuperuser;",
         ];
         let expected = [
             "ALTER USER username WITH PASSWORD 'password'",
             "ALTER USER username WITH PASSWORD 'password' SUPERUSER",
-            "ALTER USER username WITH PASSWORD 'password' NOSUPERUSER"
+            "ALTER USER username WITH PASSWORD 'password' NOSUPERUSER",
         ];
         test_parsing(&expected, &stmts);
     }
-
 }

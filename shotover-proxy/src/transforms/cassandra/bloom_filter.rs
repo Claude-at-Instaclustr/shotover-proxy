@@ -644,7 +644,7 @@ impl CassandraBloomFilter {
             | MessageValue::Timestamp(i)
             | MessageValue::Time(i)
             | MessageValue::Counter(i) => match relation_value.parse::<i64>() {
-                Ok(v) => relation_element.oper.eval(i,&v),
+                Ok(v) => relation_element.oper.eval(i, &v),
                 Err(e) => false,
             },
 
@@ -660,26 +660,26 @@ impl CassandraBloomFilter {
 
             MessageValue::Boolean(b) => {
                 let v = relation_value.to_uppercase().eq("TRUE");
-                relation_element.oper.eval(b,&v)
+                relation_element.oper.eval(b, &v)
             }
 
             MessageValue::Inet(ipaddr) => match IpAddr::from_str(relation_value.as_str()) {
-                Ok(v) => relation_element.oper.eval(ipaddr,&v),
+                Ok(v) => relation_element.oper.eval(ipaddr, &v),
                 Err(e) => false,
             },
 
             MessageValue::Varint(i) => match relation_value.parse::<BigInt>() {
-                Ok(v) => relation_element.oper.eval(i,&v),
+                Ok(v) => relation_element.oper.eval(i, &v),
                 Err(e) => false,
             },
 
             MessageValue::Decimal(d) => match relation_value.parse::<BigDecimal>() {
-                Ok(v) => relation_element.oper.eval(d,&v),
+                Ok(v) => relation_element.oper.eval(d, &v),
                 Err(e) => false,
             },
 
             MessageValue::Date(i) => match relation_value.parse::<i32>() {
-                Ok(v) => relation_element.oper.eval(i,&v),
+                Ok(v) => relation_element.oper.eval(i, &v),
                 Err(e) => false,
             },
 
