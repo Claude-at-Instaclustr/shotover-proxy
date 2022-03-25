@@ -29,6 +29,10 @@ use std::net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::string::FromUtf8Error;
 use std::time::Duration;
+use cql3_parser::cassandra_ast::CassandraAST;
+use cql3_parser::cassandra_statement::CassandraStatement;
+use cql3_parser::common::{Operand, RelationElement, RelationOperator};
+use cql3_parser::select::{Named, SelectElement,Select};
 use tls_parser::nom::AsBytes;
 
 use crate::codec::cassandra::CassandraCodec;
@@ -44,10 +48,7 @@ use uuid::Uuid;
 
 //use proc_macro::TokenTree;
 use crate::frame::CassandraOperation::Error;
-use crate::transforms::cassandra::cassandra_ast::{
-    CassandraAST, CassandraStatement, Named, Operand, OrderClause, RelationElement,
-    RelationOperator, SelectElement, SelectStatementData,
-};
+
 
 /// The configuration for a single bloom filter in a single table.
 #[derive(Deserialize, Debug, Clone)]
@@ -149,7 +150,7 @@ impl CassandraBloomFilter {
     /// impact the Bloom filter.
     fn process_query(&self, state: &mut BloomFilterState) -> Option<Message> {
         match &state.statement {
-            CassandraStatement::SelectStatement(statement_data) => {
+            CassandraStatement::Select(statement_data) => {
                 let table_name = state.fixup_table_name(statement_data.table_name.clone());
                 let cfg = self.tables.get(&table_name);
                 match cfg {
@@ -175,7 +176,7 @@ impl CassandraBloomFilter {
                     }
                 }
             }
-            CassandraStatement::UseStatement(keyspace) => {
+            CassandraStatement::Use(keyspace) => {
                 state.default_keyspace = Some(keyspace.clone());
                 None
             }
@@ -322,8 +323,8 @@ impl CassandraBloomFilter {
     fn process_select(
         state: &mut BloomFilterState,
         config: &CassandraBloomFilterTableConfig,
-        select_data: &SelectStatementData,
-    ) -> Result<Option<SelectStatementData>, String> {
+        select_data: &Select,
+    ) -> Result<Option<Select>, String> {
         // we need to
         // remove any where clauses that have the bloom filter columns
         // build a bloom filter with the values
@@ -357,7 +358,7 @@ impl CassandraBloomFilter {
                     .unwrap()
                     .iter()
                     .map(|re| match &re.obj {
-                        Operand::LIST(_) => true,
+                        Operand::List(_) => true,
                         _ => false,
                     })
                     .reduce(|a, b| (a | b))
@@ -377,7 +378,7 @@ impl CassandraBloomFilter {
                     .unwrap()
                     .iter()
                     .filter(|re| match &re.obj {
-                        Operand::COLUMN(name) => !(has_filter && name.eq(&config.bloom_column)),
+                        Operand::Column(name) => !(has_filter && name.eq(&config.bloom_column)),
                         _ => false,
                     })
                     .collect()
@@ -390,7 +391,7 @@ impl CassandraBloomFilter {
             for relation in interesting_relations {
                 if !has_filter
                     && match relation.oper {
-                        RelationOperator::EQ => false,
+                        RelationOperator::Equal => false,
                         _ => true,
                     }
                 {
@@ -402,8 +403,8 @@ impl CassandraBloomFilter {
 
                 // add the relation to the added selects
                 match &relation.obj {
-                    Operand::COLUMN(name) => {
-                        state.added_selects.push(SelectElement::COLUMN(Named {
+                    Operand::Column(name) => {
+                        state.added_selects.push(SelectElement::Column(Named {
                             name: name.clone(),
                             alias: None,
                         }));
@@ -419,7 +420,7 @@ impl CassandraBloomFilter {
                 state.verify_funcs.push(relation.clone())
             }
             // remove duplicate select columns
-            if select_data.elements.contains(&SelectElement::STAR) {
+            if select_data.columns.contains(&SelectElement::Star) {
                 state.added_selects.truncate(0);
             } else {
                 state
@@ -439,11 +440,11 @@ impl CassandraBloomFilter {
                 }
 
                 let where_stmt = RelationElement {
-                    obj: Operand::COLUMN(config.bloom_column.clone()),
-                    oper: RelationOperator::EQ,
+                    obj: Operand::Column(config.bloom_column.clone()),
+                    oper: RelationOperator::Equal,
                     value: {
                         let mut result = vec![];
-                        result.push(Operand::CONST(CassandraBloomFilter::as_hex(&filter)));
+                        result.push(Operand::Const(CassandraBloomFilter::as_hex(&filter)));
                         result
                     },
                 };
@@ -544,7 +545,7 @@ impl CassandraBloomFilter {
                     .iter()
                     .map(|re| {
                         let name = match &re.obj {
-                            Operand::COLUMN(name) => name,
+                            Operand::Column(name) => name,
                             _ => unreachable!(),
                         };
                         for i in 0..metadata.columns_count {
@@ -588,7 +589,7 @@ impl CassandraBloomFilter {
                         // if there is a verify func for the column execute it.
                         for vf in &state.verify_funcs {
                             let name = match &vf.obj {
-                                Operand::COLUMN(name) => name,
+                                Operand::Column(name) => name,
                                 _ => unreachable!(),
                             };
                             if bt.contains_key(name) {
@@ -894,17 +895,17 @@ impl BloomFilterState {
         self.added_selects
             .iter()
             .map(|se| match se {
-                SelectElement::COLUMN(named) => named.alias_or_name(),
+                SelectElement::Column(named) => named.alias_or_name(),
                 _ => unreachable!(),
             })
             .collect()
     }
 
     /// rewrite the select statement data as a _NEW_ select statement data object.
-    pub fn rewrite_select(&self, select_data: &SelectStatementData) -> SelectStatementData {
+    pub fn rewrite_select(&self, select_data: &Select) -> Select {
         let mut new_elements: Vec<SelectElement> = vec![];
         select_data
-            .elements
+            .columns
             .iter()
             .for_each(|s| new_elements.push(s.clone()));
         self.added_selects
@@ -927,10 +928,9 @@ impl BloomFilterState {
             .iter()
             .for_each(|w| new_where.push(w.clone()));
 
-        let mut result = SelectStatementData {
-            modifiers: select_data.modifiers.clone(),
+        let mut result = Select {
+            distinct: select_data.distinct,
             table_name: select_data.table_name.clone(),
-            elements: new_elements,
             where_clause: if new_where.is_empty() {
                 None
             } else {
@@ -940,8 +940,11 @@ impl BloomFilterState {
                 None => None,
                 Some(x) => Some(x.clone()),
             },
+            limit: None,
+            json: select_data.json,
+            columns: select_data.columns.clone(),
+            filtering: select_data.filtering
         };
-        result.modifiers.limit = None;
         result
     }
 }
@@ -969,11 +972,7 @@ mod test {
     use crate::transforms::cassandra::bloom_filter::{
         BloomFilterState, CassandraBloomFilter, CassandraBloomFilterTableConfig,
     };
-    use crate::transforms::cassandra::cassandra_ast::CassandraStatement::SelectStatement;
-    use crate::transforms::cassandra::cassandra_ast::{
-        CassandraAST, CassandraStatement, Named, Operand, RelationElement, RelationOperator,
-        SelectElement, SelectStatementData,
-    };
+
     use cassandra_protocol::frame::frame_result::{
         ColSpec, ColType, ColTypeOption, RowsMetadata, RowsMetadataFlags,
     };
@@ -981,6 +980,10 @@ mod test {
     use itertools::Itertools;
     use reduce::Reduce;
     use std::collections::HashMap;
+    use cql3_parser::cassandra_ast::CassandraAST;
+    use cql3_parser::cassandra_statement::CassandraStatement;
+    use cql3_parser::common::{Operand, RelationElement, RelationOperator};
+    use cql3_parser::select::{Named, Select, SelectElement};
 
     pub fn build_message(select_stmt: &String) -> Message {
         let frame = CassandraFrame {
@@ -1013,9 +1016,9 @@ mod test {
         ast: &CassandraAST,
         state: &mut BloomFilterState,
         config: &CassandraBloomFilterTableConfig,
-    ) -> Option<SelectStatementData> {
+    ) -> Option<Select> {
         let result = match &ast.statement {
-            SelectStatement(select_data) => {
+            CassandraStatement::Select(select_data) => {
                 CassandraBloomFilter::process_select(state, &config, &select_data)
             }
             _ => panic!("Not a select statement"),
@@ -1047,17 +1050,17 @@ mod test {
 
         let result = get_select_result(&ast, &mut state, &config);
 
-        let expected_select = SelectElement::COLUMN(Named {
+        let expected_select = SelectElement::Column(Named {
             name: "bfCol1".to_string(),
             alias: None,
         });
 
         let expected_verify = RelationElement {
-            obj: Operand::COLUMN("bfCol1".to_string()),
-            oper: RelationOperator::EQ,
+            obj: Operand::Column("bfCol1".to_string()),
+            oper: RelationOperator::Equal,
             value: {
                 let mut v = vec![];
-                v.push(Operand::CONST("'bar'".to_string()));
+                v.push(Operand::Const("'bar'".to_string()));
                 v
             },
         };
@@ -1111,17 +1114,17 @@ mod test {
 
         let result = get_select_result(&ast, &mut state, &config);
 
-        let expected_select = SelectElement::COLUMN(Named {
+        let expected_select = SelectElement::Column(Named {
             name: "bfCol1".to_string(),
             alias: None,
         });
 
         let expected_verify = RelationElement {
-            obj: Operand::COLUMN("bfCol1".to_string()),
-            oper: RelationOperator::NE,
+            obj: Operand::Column("bfCol1".to_string()),
+            oper: RelationOperator::NotEqual,
             value: {
                 let mut v = vec![];
-                v.push(Operand::CONST("'bar'".to_string()));
+                v.push(Operand::Const("'bar'".to_string()));
                 v
             },
         };
@@ -1326,23 +1329,23 @@ mod test {
 
         let mut verify_funcs = vec![];
         verify_funcs.push(RelationElement {
-            obj: Operand::COLUMN("bfCol".to_string()),
-            oper: RelationOperator::LT,
+            obj: Operand::Column("bfCol".to_string()),
+            oper: RelationOperator::LessThan,
             value: {
                 let mut v = vec![];
-                v.push(Operand::CONST("10".to_string()));
+                v.push(Operand::Const("10".to_string()));
                 v
             },
         });
 
         let mut added_selects = vec![];
-        added_selects.push(SelectElement::COLUMN(Named {
+        added_selects.push(SelectElement::Column(Named {
             name: "bfCol".to_string(),
             alias: None,
         }));
 
         let mut state = BloomFilterState {
-            statement: CassandraStatement::UNKNOWN("dummy".to_string()),
+            statement: CassandraStatement::Unknown("dummy".to_string()),
             ignore: false,
             original_msg: None,
             verify_funcs,

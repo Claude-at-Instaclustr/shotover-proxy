@@ -67,6 +67,8 @@ cassandra-protocol = { git = "https://github.com/krojew/cdrs-tokio" }
 crc16 = "0.4.0"
 ordered-float = { version = "2.8.0", features = ["serde"] }
 
+cql3_parser = { git = "https://github.com/Claude-at-Instaclustr/rust_cql3_parser", branch="modularize" }
+
 bloomfilter = { git = "https://github.com/Claude-at-Instaclustr/rusty_bloomfilter", brach="main" }
 murmur3 = "^0.5.1"
 
