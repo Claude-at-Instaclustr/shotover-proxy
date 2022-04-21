@@ -1,5 +1,8 @@
 use crate::codec::redis::redis_query_type;
-use crate::frame::cassandra::CassandraOperation;
+use crate::frame::{
+    cassandra,
+    cassandra::{CassandraMetadata, CassandraOperation},
+};
 use crate::frame::{CassandraFrame, Frame, MessageType, RedisFrame};
 use anyhow::{anyhow, Result};
 use bigdecimal::BigDecimal;
@@ -17,13 +20,21 @@ use cassandra_protocol::{
     },
 };
 use itertools::Itertools;
+use nonzero_ext::nonzero;
 use num::BigInt;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Value as SQLValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use uuid::Uuid;
+
+enum Metadata {
+    Cassandra(CassandraMetadata),
+    Redis,
+    None,
+}
 
 pub type Messages = Vec<Message>;
 
@@ -49,6 +60,7 @@ pub struct Message {
     pub meta_timestamp: Option<i64>,
 }
 
+/// `from_*` methods for `Message`
 impl Message {
     /// This method should be called when you have have just the raw bytes of a message.
     /// This is expected to be used only by codecs that are decoding a protocol where the length of the message is provided in the header. e.g. cassandra
@@ -85,7 +97,10 @@ impl Message {
             meta_timestamp: None,
         }
     }
+}
 
+/// Methods for interacting with `Message::inner`
+impl Message {
     /// Returns a `&mut Frame` which contains the processed contents of the message.
     /// A transform may choose to modify the contents of the `&mut Frame` in order to modify the message that is sent to the DB.
     /// Any future calls to `frame()` in the same or future transforms will return the same modified `&mut Frame`.
@@ -167,6 +182,29 @@ impl Message {
         }
     }
 
+    /// Batch messages have a cell count of 1 cell per inner message.
+    /// Cell count is determined as follows:
+    /// * Regular message - 1 cell
+    /// * Message containing submessages e.g. a batch request - 1 cell per submessage
+    /// * Message containing submessages with 0 submessages - 1 cell
+    pub fn cell_count(&self) -> Result<NonZeroU32> {
+        Ok(match self.inner.as_ref().unwrap() {
+            MessageInner::RawBytes {
+                bytes,
+                message_type,
+            } => match message_type {
+                MessageType::Redis => nonzero!(1u32),
+                MessageType::None => nonzero!(1u32),
+                MessageType::Cassandra => cassandra::cell_count(bytes)?,
+            },
+            MessageInner::Modified { frame } | MessageInner::Parsed { frame, .. } => match frame {
+                Frame::Cassandra(frame) => frame.cell_count()?,
+                Frame::Redis(_) => nonzero!(1u32),
+                Frame::None => nonzero!(1u32),
+            },
+        })
+    }
+
     /// Invalidates all internal caches.
     /// This must be called after any modifications to the return value of `Message::frame()`.
     /// Otherwise values returned by getter methods and the message sent to the DB will be outdated.
@@ -230,6 +268,54 @@ impl Message {
             Frame::None => Frame::None,
         });
         self.invalidate_cache();
+    }
+
+    /// Get metadata for this `Message`
+    fn metadata(&self) -> Result<Metadata> {
+        match self.inner.as_ref().unwrap() {
+            MessageInner::RawBytes {
+                bytes,
+                message_type,
+            } => match message_type {
+                MessageType::Cassandra => Ok(Metadata::Cassandra(cassandra::metadata(&*bytes)?)),
+                MessageType::Redis => Ok(Metadata::Redis),
+                MessageType::None => Ok(Metadata::None),
+            },
+            MessageInner::Parsed { frame, .. } | MessageInner::Modified { frame } => match frame {
+                Frame::Cassandra(frame) => Ok(Metadata::Cassandra(frame.metadata())),
+                Frame::Redis(_) => Ok(Metadata::Redis),
+                Frame::None => Ok(Metadata::None),
+            },
+        }
+    }
+
+    /// Set this `Message` to a backpressure response
+    pub fn set_backpressure(&mut self) -> Result<()> {
+        let metadata = self.metadata()?;
+
+        *self = Message::from_frame(match metadata {
+            Metadata::Cassandra(metadata) => {
+                let body = CassandraOperation::Error(ErrorBody {
+                    error_code: 0x1001,
+                    message: "".into(),
+                    additional_info: AdditionalErrorInfo::Overloaded,
+                });
+
+                Frame::Cassandra(CassandraFrame {
+                    version: metadata.version,
+                    stream_id: metadata.stream_id,
+                    tracing_id: metadata.tracing_id,
+                    warnings: vec![],
+                    operation: body,
+                })
+            }
+            Metadata::Redis => {
+                unimplemented!()
+            }
+            Metadata::None => Frame::None,
+        });
+
+        Ok(())
     }
 
     // Retrieves the stream_id without parsing the rest of the frame.

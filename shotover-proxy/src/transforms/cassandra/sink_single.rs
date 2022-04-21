@@ -28,7 +28,7 @@ pub struct CassandraSinkSingleConfig {
 }
 
 impl CassandraSinkSingleConfig {
-    pub async fn get_source(&self, chain_name: String) -> Result<Transforms> {
+    pub async fn get_transform(&self, chain_name: String) -> Result<Transforms> {
         let tls = self.tls.clone().map(TlsConnector::new).transpose()?;
         Ok(Transforms::CassandraSinkSingle(CassandraSinkSingle::new(
             self.address.clone(),
@@ -48,11 +48,13 @@ pub struct CassandraSinkSingle {
 
 impl Clone for CassandraSinkSingle {
     fn clone(&self) -> Self {
-        CassandraSinkSingle::new(
-            self.address.clone(),
-            self.chain_name.clone(),
-            self.tls.clone(),
-        )
+        CassandraSinkSingle {
+            address: self.address.clone(),
+            outbound: None,
+            chain_name: self.chain_name.clone(),
+            tls: self.tls.clone(),
+            failed_requests: self.failed_requests.clone(),
+        }
     }
 }
 

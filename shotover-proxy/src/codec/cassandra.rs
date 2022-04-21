@@ -371,7 +371,7 @@ mod cassandra_protocol_tests {
             tracing_id: None,
             warnings: vec![],
             operation: CassandraOperation::Query {
-                query: CQL::Parsed(vec![Statement::Query(Box::new(Query {
+                query: CQL::Parsed(Box::new(Statement::Query(Box::new(Query {
                     with: None,
                     body: SetExpr::Select(Box::new(Select {
                         distinct: false,
@@ -411,12 +411,14 @@ mod cassandra_protocol_tests {
                         distribute_by: vec![],
                         sort_by: vec![],
                         having: None,
+                        into: None,
                     })),
                     order_by: vec![],
                     limit: None,
                     offset: None,
                     fetch: None,
-                }))]),
+                    lock: None,
+                })))),
                 params: QueryParams::default(),
             },
         }))];
@@ -437,7 +439,7 @@ mod cassandra_protocol_tests {
             tracing_id: None,
             warnings: vec![],
             operation: CassandraOperation::Query {
-                query: CQL::Parsed(vec![Statement::Insert {
+                query: CQL::Parsed(Box::new(Statement::Insert {
                     or: None,
                     table_name: ObjectName(vec![
                         Ident {
@@ -463,12 +465,13 @@ mod cassandra_protocol_tests {
                         limit: None,
                         offset: None,
                         fetch: None,
+                        lock: None,
                     }),
                     partitioned: None,
                     after_columns: (vec![]),
                     table: false,
                     on: None,
-                }]),
+                })),
                 params: QueryParams::default(),
             },
         }))];

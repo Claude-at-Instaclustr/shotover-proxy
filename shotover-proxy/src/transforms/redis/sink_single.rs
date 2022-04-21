@@ -23,7 +23,7 @@ pub struct RedisSinkSingleConfig {
 }
 
 impl RedisSinkSingleConfig {
-    pub async fn get_source(&self, chain_name: String) -> Result<Transforms> {
+    pub async fn get_transform(&self, chain_name: String) -> Result<Transforms> {
         let tls = self.tls.clone().map(TlsConnector::new).transpose()?;
         Ok(Transforms::RedisSinkSingle(RedisSinkSingle::new(
             self.address.clone(),
@@ -43,11 +43,13 @@ pub struct RedisSinkSingle {
 
 impl Clone for RedisSinkSingle {
     fn clone(&self) -> Self {
-        RedisSinkSingle::new(
-            self.address.clone(),
-            self.tls.clone(),
-            self.chain_name.clone(),
-        )
+        RedisSinkSingle {
+            address: self.address.clone(),
+            tls: self.tls.clone(),
+            outbound: None,
+            chain_name: self.chain_name.clone(),
+            failed_requests: self.failed_requests.clone(),
+        }
     }
 }
 

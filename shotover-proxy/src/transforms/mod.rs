@@ -6,6 +6,9 @@ use crate::transforms::cassandra::peers_rewrite::CassandraPeersRewriteConfig;
 use crate::transforms::cassandra::sink_single::{CassandraSinkSingle, CassandraSinkSingleConfig};
 use crate::transforms::chain::TransformChain;
 use crate::transforms::coalesce::{Coalesce, CoalesceConfig};
+use crate::transforms::debug::force_parse::DebugForceParse;
+#[cfg(feature = "alpha-transforms")]
+use crate::transforms::debug::force_parse::DebugForceParseConfig;
 use crate::transforms::debug::printer::DebugPrinter;
 use crate::transforms::debug::random_delay::DebugRandomDelay;
 use crate::transforms::debug::returner::{DebugReturner, DebugReturnerConfig};
@@ -30,6 +33,7 @@ use crate::transforms::redis::sink_cluster::{RedisSinkCluster, RedisSinkClusterC
 use crate::transforms::redis::sink_single::{RedisSinkSingle, RedisSinkSingleConfig};
 use crate::transforms::redis::timestamp_tagging::RedisTimestampTagger;
 use crate::transforms::tee::{Tee, TeeConfig};
+use crate::transforms::throttling::{RequestThrottling, RequestThrottlingConfig};
 use anyhow::Result;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -59,6 +63,7 @@ pub mod query_counter;
 pub mod redis;
 pub mod sampler;
 pub mod tee;
+pub mod throttling;
 pub mod util;
 
 //TODO Generate the trait implementation for this passthrough enum via a macro
@@ -84,11 +89,13 @@ pub enum Transforms {
     DebugReturner(DebugReturner),
     DebugRandomDelay(DebugRandomDelay),
     DebugPrinter(DebugPrinter),
+    DebugForceParse(DebugForceParse),
     ParallelMap(ParallelMap),
     PoolConnections(ConnectionBalanceAndPool),
     Coalesce(Coalesce),
     QueryTypeFilter(QueryTypeFilter),
     QueryCounter(QueryCounter),
+    RequestThrottling(RequestThrottling),
 }
 
 impl Debug for Transforms {
@@ -105,6 +112,7 @@ impl Transforms {
             Transforms::RedisCache(r) => r.transform(message_wrapper).await,
             Transforms::Tee(m) => m.transform(message_wrapper).await,
             Transforms::DebugPrinter(p) => p.transform(message_wrapper).await,
+            Transforms::DebugForceParse(p) => p.transform(message_wrapper).await,
             Transforms::Null(n) => n.transform(message_wrapper).await,
             #[cfg(test)]
             Transforms::Loopback(n) => n.transform(message_wrapper).await,
@@ -121,6 +129,7 @@ impl Transforms {
             Transforms::Coalesce(s) => s.transform(message_wrapper).await,
             Transforms::QueryTypeFilter(s) => s.transform(message_wrapper).await,
             Transforms::QueryCounter(s) => s.transform(message_wrapper).await,
+            Transforms::RequestThrottling(s) => s.transform(message_wrapper).await,
         }
     }
 
@@ -136,6 +145,7 @@ impl Transforms {
             Transforms::RedisCache(a) => a.prep_transform_chain(t).await,
             Transforms::Tee(a) => a.prep_transform_chain(t).await,
             Transforms::DebugPrinter(a) => a.prep_transform_chain(t).await,
+            Transforms::DebugForceParse(a) => a.prep_transform_chain(t).await,
             Transforms::Null(a) => a.prep_transform_chain(t).await,
             #[cfg(test)]
             Transforms::Loopback(a) => a.prep_transform_chain(t).await,
@@ -151,6 +161,7 @@ impl Transforms {
             Transforms::Coalesce(s) => s.prep_transform_chain(t).await,
             Transforms::QueryTypeFilter(s) => s.prep_transform_chain(t).await,
             Transforms::QueryCounter(s) => s.prep_transform_chain(t).await,
+            Transforms::RequestThrottling(s) => s.prep_transform_chain(t).await,
         }
     }
 
@@ -165,6 +176,7 @@ impl Transforms {
             Transforms::RedisTimestampTagger(r) => r.validate(),
             Transforms::RedisClusterPortsRewrite(r) => r.validate(),
             Transforms::DebugPrinter(p) => p.validate(),
+            Transforms::DebugForceParse(p) => p.validate(),
             Transforms::Null(n) => n.validate(),
             Transforms::RedisSinkCluster(r) => r.validate(),
             Transforms::ParallelMap(s) => s.validate(),
@@ -177,6 +189,7 @@ impl Transforms {
             Transforms::Protect(p) => p.validate(),
             Transforms::DebugReturner(d) => d.validate(),
             Transforms::DebugRandomDelay(d) => d.validate(),
+            Transforms::RequestThrottling(d) => d.validate(),
         }
     }
 
@@ -191,6 +204,7 @@ impl Transforms {
             Transforms::RedisTimestampTagger(r) => r.is_terminating(),
             Transforms::RedisClusterPortsRewrite(r) => r.is_terminating(),
             Transforms::DebugPrinter(p) => p.is_terminating(),
+            Transforms::DebugForceParse(p) => p.is_terminating(),
             Transforms::Null(n) => n.is_terminating(),
             Transforms::RedisSinkCluster(r) => r.is_terminating(),
             Transforms::ParallelMap(s) => s.is_terminating(),
@@ -203,6 +217,7 @@ impl Transforms {
             Transforms::Protect(p) => p.is_terminating(),
             Transforms::DebugReturner(d) => d.is_terminating(),
             Transforms::DebugRandomDelay(d) => d.is_terminating(),
+            Transforms::RequestThrottling(d) => d.is_terminating(),
         }
     }
 }
@@ -227,45 +242,51 @@ pub enum TransformsConfig {
     Loopback,
     #[cfg(feature = "alpha-transforms")]
     Protect(ProtectConfig),
+    #[cfg(feature = "alpha-transforms")]
+    DebugForceParse(DebugForceParseConfig),
     ParallelMap(ParallelMapConfig),
     //PoolConnections(ConnectionBalanceAndPoolConfig),
     Coalesce(CoalesceConfig),
     QueryTypeFilter(QueryTypeFilterConfig),
     QueryCounter(QueryCounterConfig),
+    RequestThrottling(RequestThrottlingConfig),
 }
 
 impl TransformsConfig {
     #[async_recursion]
     /// Return a new instance of the transform that the config is specifying.
-    pub async fn get_transforms(
+    pub async fn get_transform(
         &self,
         topics: &TopicHolder,
         chain_name: String,
     ) -> Result<Transforms> {
         match self {
-            TransformsConfig::CassandraSinkSingle(c) => c.get_source(chain_name).await,
-            TransformsConfig::CassandraPeersRewrite(c) => c.get_source(topics).await,
-            TransformsConfig::RedisCache(r) => r.get_source(topics).await,
-            TransformsConfig::Tee(t) => t.get_source(topics).await,
-            TransformsConfig::RedisSinkSingle(r) => r.get_source(chain_name).await,
-            TransformsConfig::ConsistentScatter(c) => c.get_source(topics).await,
+            TransformsConfig::CassandraSinkSingle(c) => c.get_transform(chain_name).await,
+            TransformsConfig::CassandraPeersRewrite(c) => c.get_transform().await,
+            TransformsConfig::RedisCache(r) => r.get_transform(topics).await,
+            TransformsConfig::Tee(t) => t.get_transform(topics).await,
+            TransformsConfig::RedisSinkSingle(r) => r.get_transform(chain_name).await,
+            TransformsConfig::ConsistentScatter(c) => c.get_transform(topics).await,
             TransformsConfig::RedisTimestampTagger => {
                 Ok(Transforms::RedisTimestampTagger(RedisTimestampTagger::new()))
             }
-            TransformsConfig::RedisClusterPortsRewrite(r) => r.get_source().await,
+            TransformsConfig::RedisClusterPortsRewrite(r) => r.get_transform().await,
             TransformsConfig::DebugPrinter => Ok(Transforms::DebugPrinter(DebugPrinter::new())),
-            TransformsConfig::DebugReturner(d) => d.get_source().await,
+            TransformsConfig::DebugReturner(d) => d.get_transform().await,
             TransformsConfig::Null => Ok(Transforms::Null(Null::default())),
             #[cfg(test)]
             TransformsConfig::Loopback => Ok(Transforms::Loopback(Loopback::default())),
             #[cfg(feature = "alpha-transforms")]
-            TransformsConfig::Protect(p) => p.get_source().await,
-            TransformsConfig::RedisSinkCluster(r) => r.get_source(chain_name).await,
-            TransformsConfig::ParallelMap(s) => s.get_source(topics).await,
-            //TransformsConfig::PoolConnections(s) => s.get_source(topics).await,
-            TransformsConfig::Coalesce(s) => s.get_source().await,
-            TransformsConfig::QueryTypeFilter(s) => s.get_source().await,
-            TransformsConfig::QueryCounter(s) => s.get_source().await,
+            TransformsConfig::Protect(p) => p.get_transform().await,
+            #[cfg(feature = "alpha-transforms")]
+            TransformsConfig::DebugForceParse(d) => d.get_transform().await,
+            TransformsConfig::RedisSinkCluster(r) => r.get_transform(chain_name).await,
+            TransformsConfig::ParallelMap(s) => s.get_transform(topics).await,
+            //TransformsConfig::PoolConnections(s) => s.get_transform(topics).await,
+            TransformsConfig::Coalesce(s) => s.get_transform().await,
+            TransformsConfig::QueryTypeFilter(s) => s.get_transform().await,
+            TransformsConfig::QueryCounter(s) => s.get_transform().await,
+            TransformsConfig::RequestThrottling(s) => s.get_transform().await,
         }
     }
 }
@@ -277,10 +298,12 @@ pub async fn build_chain_from_config(
 ) -> Result<TransformChain> {
     let mut transforms: Vec<Transforms> = Vec::new();
     for tc in transform_configs {
-        transforms.push(tc.get_transforms(topics, name.clone()).await?)
+        transforms.push(tc.get_transform(topics, name.clone()).await?)
     }
     Ok(TransformChain::new(transforms, name))
 }
+
+use std::slice::IterMut;
 
 /// The [`Wrapper`] struct is passed into each transform and contains a list of mutable references to the
 /// remaining transforms that will process the messages attached to this [`Wrapper`].
@@ -288,7 +311,7 @@ pub async fn build_chain_from_config(
 #[derive(Debug)]
 pub struct Wrapper<'a> {
     pub messages: Messages,
-    transforms: Vec<&'a mut Transforms>,
+    transforms: IterMut<'a, Transforms>,
     pub client_details: String,
     chain_name: String,
     /// When true transforms must flush any buffered messages into the messages field.
@@ -304,7 +327,7 @@ impl<'a> Clone for Wrapper<'a> {
     fn clone(&self) -> Self {
         Wrapper {
             messages: self.messages.clone(),
-            transforms: vec![],
+            transforms: [].iter_mut(),
             client_details: self.client_details.clone(),
             chain_name: self.chain_name.clone(),
             flush: false,
@@ -332,10 +355,10 @@ impl<'a> Wrapper<'a> {
     ///
     /// The result of calling the next transform is then provided as a response.
     pub async fn call_next_transform(mut self) -> ChainResponse {
-        if self.transforms.is_empty() {
-            panic!("The transform chain does not end with a terminating transform. If you want to throw the messages away use a Null transform, otherwise use a terminating sink transform to send the messages somewhere.");
-        }
-        let transform = self.transforms.remove(0);
+        let transform = match self.transforms.next() {
+            Some(transform) => transform,
+            None => panic!("The transform chain does not end with a terminating transform. If you want to throw the messages away use a Null transform, otherwise use a terminating sink transform to send the messages somewhere.")
+        };
 
         let transform_name = transform.get_name();
         let chain_name = self.chain_name.clone();
@@ -356,7 +379,7 @@ impl<'a> Wrapper<'a> {
     pub fn new(m: Messages) -> Self {
         Wrapper {
             messages: m,
-            transforms: vec![],
+            transforms: [].iter_mut(),
             client_details: "".to_string(),
             chain_name: "".to_string(),
             flush: false,
@@ -366,7 +389,7 @@ impl<'a> Wrapper<'a> {
     pub fn new_with_chain_name(m: Messages, chain_name: String) -> Self {
         Wrapper {
             messages: m,
-            transforms: vec![],
+            transforms: [].iter_mut(),
             client_details: "".to_string(),
             chain_name,
             flush: false,
@@ -376,7 +399,7 @@ impl<'a> Wrapper<'a> {
     pub fn flush_with_chain_name(chain_name: String) -> Self {
         Wrapper {
             messages: vec![],
-            transforms: vec![],
+            transforms: [].iter_mut(),
             client_details: "".into(),
             chain_name,
             flush: true,
@@ -390,15 +413,15 @@ impl<'a> Wrapper<'a> {
     ) -> Self {
         Wrapper {
             messages: m,
-            transforms: vec![],
+            transforms: [].iter_mut(),
             client_details,
             chain_name,
             flush: false,
         }
     }
 
-    pub fn reset(&mut self, transforms: Vec<&'a mut Transforms>) {
-        self.transforms = transforms;
+    pub fn reset(&mut self, transforms: &'a mut [Transforms]) {
+        self.transforms = transforms.iter_mut();
     }
 }
 

@@ -1,11 +1,10 @@
 use crate::codec::redis::RedisCodec;
 use crate::config::topology::TopicHolder;
 use crate::server::TcpCodecListener;
-use crate::sources::{Sources, SourcesFromConfig};
+use crate::sources::Sources;
 use crate::tls::{TlsAcceptor, TlsConfig};
 use crate::transforms::chain::TransformChain;
 use anyhow::Result;
-use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -21,9 +20,8 @@ pub struct RedisConfig {
     pub tls: Option<TlsConfig>,
 }
 
-#[async_trait]
-impl SourcesFromConfig for RedisConfig {
-    async fn get_source(
+impl RedisConfig {
+    pub async fn get_source(
         &self,
         chain: &TransformChain,
         _topics: &mut TopicHolder,
@@ -71,7 +69,8 @@ impl RedisSource {
             Arc::new(Semaphore::new(connection_limit.unwrap_or(512))),
             trigger_shutdown_rx.clone(),
             tls.map(TlsAcceptor::new).transpose()?,
-        );
+        )
+        .await?;
 
         let join_handle = Handle::current().spawn(async move {
             // Check we didn't receive a shutdown signal before the receiver was created

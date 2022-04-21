@@ -16,7 +16,7 @@ pub struct QueryTypeFilterConfig {
 }
 
 impl QueryTypeFilterConfig {
-    pub async fn get_source(&self) -> Result<Transforms> {
+    pub async fn get_transform(&self) -> Result<Transforms> {
         Ok(Transforms::QueryTypeFilter(QueryTypeFilter {
             filter: self.filter.clone(),
         }))
@@ -71,7 +71,7 @@ mod test {
             filter: QueryType::Read,
         };
 
-        let mut loopback = Transforms::Loopback(Loopback::default());
+        let mut chain = vec![Transforms::Loopback(Loopback::default())];
 
         let messages: Vec<_> = (0..26)
             .map(|i| {
@@ -91,7 +91,7 @@ mod test {
             .collect();
 
         let mut message_wrapper = Wrapper::new(messages);
-        message_wrapper.transforms = vec![&mut loopback];
+        message_wrapper.reset(&mut chain);
         let result = filter_transform.transform(message_wrapper).await.unwrap();
 
         assert_eq!(result.len(), 26);

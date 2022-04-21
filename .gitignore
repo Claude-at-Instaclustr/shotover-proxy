@@ -6,6 +6,7 @@
 tests/soaktest-*
 *.gz
 /.vscode
+/shotover-proxy/example-configs/redis-tls/certs
 .workspace.code-workspace
 /test_tmp
 output.txt
@@ -14,3 +15,5 @@ output.txt
 /test_data
 /docs/book
 /docs/mdbook_bin
+shotover-proxy/read-localhost:9042.json
+shotover-proxy/read-localhost:9043.json
