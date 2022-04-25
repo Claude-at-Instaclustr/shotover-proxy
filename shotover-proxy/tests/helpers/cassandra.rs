@@ -1,5 +1,6 @@
 use cassandra_cpp::{stmt, Cluster, Error, Session, Value, ValueType};
 use ordered_float::OrderedFloat;
+use tracing_log::log::debug;
 
 pub fn cassandra_connection(contact_points: &str, port: u16) -> Session {
     for contact_point in contact_points.split(',') {
@@ -10,7 +11,11 @@ pub fn cassandra_connection(contact_points: &str, port: u16) -> Session {
     cluster.set_credentials("cassandra", "cassandra").unwrap();
     cluster.set_port(port).ok();
     cluster.set_load_balance_round_robin();
-    cluster.connect().unwrap()
+    let result = cluster.connect();
+    if let Some(err) = &result.as_ref().err() {
+        panic!("{}", err);
+    }
+    result.unwrap()
 }
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord)]
@@ -103,6 +108,7 @@ impl ResultValue {
 #[allow(unused)]
 pub fn execute_query(session: &Session, query: &str) -> Vec<Vec<ResultValue>> {
     let statement = stmt!(query);
+    debug!("executing query: {}", query);
     match session.execute(&statement).wait() {
         Ok(result) => result
             .into_iter()

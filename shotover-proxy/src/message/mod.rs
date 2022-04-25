@@ -1,7 +1,7 @@
 use crate::codec::redis::redis_query_type;
 use crate::frame::{
     cassandra,
-    cassandra::{CassandraMetadata, CassandraOperation},
+    cassandra::{CassandraMetadata, CassandraOperation, ToCassandraType},
 };
 use crate::frame::{CassandraFrame, Frame, MessageType, RedisFrame};
 use anyhow::{anyhow, Result};
@@ -19,12 +19,12 @@ use cassandra_protocol::{
         CBytes,
     },
 };
+use cql3_parser::common::{DataTypeName, Operand};
 use itertools::Itertools;
 use nonzero_ext::nonzero;
 use num::BigInt;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::Value as SQLValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -173,12 +173,18 @@ impl Message {
         }
     }
 
-    /// Returns None when fails to parse the message
-    pub fn namespace(&mut self) -> Option<Vec<String>> {
-        match self.frame()? {
-            Frame::Cassandra(cassandra) => Some(cassandra.namespace()),
-            Frame::Redis(_) => unimplemented!(),
-            Frame::None => Some(vec![]),
+    /// Returns the table names found in the message.
+    /// None if the statements do not contain table names.
+    pub fn get_table_names(&mut self) -> Vec<String> {
+        match self.frame() {
+            Some(Frame::Cassandra(cassandra)) => cassandra
+                .get_table_names()
+                .iter()
+                .map(|n| n.to_string())
+                .collect_vec(),
+            Some(Frame::Redis(_)) => unimplemented!(),
+            Some(Frame::None) => vec![],
+            _ => unreachable!(),
         }
     }
 
@@ -452,31 +458,121 @@ pub enum IntSize {
     I8,  // Tinyint
 }
 
-impl From<&MessageValue> for SQLValue {
+impl From<&MessageValue> for Operand {
     fn from(v: &MessageValue) -> Self {
         match v {
-            MessageValue::NULL => SQLValue::Null,
-            MessageValue::Bytes(b) => {
-                SQLValue::SingleQuotedString(String::from_utf8(b.to_vec()).unwrap())
-            } // TODO: this is definitely wrong
-            MessageValue::Strings(s) => SQLValue::SingleQuotedString(s.clone()),
-            MessageValue::Integer(i, _) => SQLValue::Number(i.to_string(), false),
-            MessageValue::Float(f) => SQLValue::Number(f.to_string(), false),
-            MessageValue::Boolean(b) => SQLValue::Boolean(*b),
-            _ => SQLValue::Null,
+            MessageValue::NULL => Operand::Null,
+            MessageValue::Bytes(b) => Operand::from(b),
+            MessageValue::Ascii(s) | MessageValue::Varchar(s) | MessageValue::Strings(s) => {
+                Operand::from(s.as_str())
+            }
+            MessageValue::Integer(i, _) => Operand::from(i),
+            MessageValue::Float(f) => Operand::from(&f.0),
+            MessageValue::Boolean(b) => Operand::from(b),
+            MessageValue::Double(d) => Operand::from(&d.0),
+            MessageValue::Inet(i) => Operand::from(i),
+            MessageValue::Varint(i) => Operand::from(i),
+            MessageValue::Decimal(d) => Operand::from(d),
+            MessageValue::Date(d) => Operand::from(d),
+            MessageValue::Time(t) | MessageValue::Counter(t) | MessageValue::Timestamp(t) => {
+                Operand::from(t)
+            }
+            MessageValue::Uuid(u) | MessageValue::Timeuuid(u) => Operand::from(u),
+
+            MessageValue::List(l) => {
+                Operand::List(l.iter().map(|x| Operand::from(x).to_string()).collect())
+            }
+
+            MessageValue::Rows(r) => Operand::Tuple(
+                r.iter()
+                    .map(|row| row.iter().map(Operand::from).collect())
+                    .map(Operand::Tuple)
+                    .collect(),
+            ),
+
+            MessageValue::NamedRows(r) => Operand::Tuple(
+                r.iter()
+                    .map(|nr| {
+                        Operand::Map(
+                            nr.iter()
+                                .map(|(k, v)| (k.clone(), Operand::from(v).to_string()))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+
+            MessageValue::Set(s) => {
+                Operand::Set(s.iter().map(|m| Operand::from(m).to_string()).collect())
+            }
+            MessageValue::Map(m) => Operand::Map(
+                m.iter()
+                    .map(|(k, v)| (Operand::from(k).to_string(), Operand::from(v).to_string()))
+                    .collect(),
+            ),
+
+            MessageValue::FragmentedResponse(t) | MessageValue::Tuple(t) => {
+                Operand::Tuple(t.iter().map(Operand::from).collect())
+            }
+
+            MessageValue::Udt(d) | MessageValue::Document(d) => Operand::Map(
+                d.iter()
+                    .map(|(k, v)| (k.clone(), Operand::from(v).to_string()))
+                    .collect(),
+            ),
+
+            MessageValue::None => Operand::Null,
         }
     }
 }
 
-impl From<&SQLValue> for MessageValue {
-    fn from(v: &SQLValue) -> Self {
+impl From<&Operand> for MessageValue {
+    fn from(operand: &Operand) -> Self {
+        operand
+            .as_cassandra_type()
+            .map_or(MessageValue::None, MessageValue::create_element)
+    }
+}
+
+impl From<&MessageValue> for DataTypeName {
+    fn from(v: &MessageValue) -> Self {
         match v {
-            SQLValue::Number(v, false)
-            | SQLValue::SingleQuotedString(v)
-            | SQLValue::NationalStringLiteral(v) => MessageValue::Strings(v.clone()),
-            SQLValue::HexStringLiteral(v) => MessageValue::Strings(v.to_string()),
-            SQLValue::Boolean(v) => MessageValue::Boolean(*v),
-            _ => MessageValue::Strings("NULL".to_string()),
+            MessageValue::Bytes(_) => DataTypeName::Blob,
+            MessageValue::Ascii(_) => DataTypeName::Ascii,
+            MessageValue::Strings(_) => DataTypeName::Text,
+            MessageValue::Integer(_, size) => {
+                match size {
+                    //DataTypeName::Int
+                    IntSize::I64 => DataTypeName::BigInt,
+                    IntSize::I32 => DataTypeName::Int,
+                    IntSize::I16 => DataTypeName::SmallInt,
+                    IntSize::I8 => DataTypeName::TinyInt,
+                }
+            }
+            MessageValue::Double(_) => DataTypeName::Double,
+            MessageValue::Float(_) => DataTypeName::Float,
+            MessageValue::Boolean(_) => DataTypeName::Boolean,
+            MessageValue::Inet(_) => DataTypeName::Inet,
+            MessageValue::List(_) => DataTypeName::List,
+            MessageValue::Rows(_) => DataTypeName::List,
+            MessageValue::NamedRows(_) => DataTypeName::Tuple,
+            MessageValue::Document(_) => DataTypeName::Tuple,
+            MessageValue::FragmentedResponse(_) => DataTypeName::Tuple,
+            MessageValue::Set(_) => DataTypeName::Set,
+            MessageValue::Map(_) => DataTypeName::Map,
+            MessageValue::Varint(_) => DataTypeName::VarInt,
+            MessageValue::Decimal(_) => DataTypeName::Decimal,
+            MessageValue::Date(_) => DataTypeName::Date,
+            MessageValue::Timestamp(_) => DataTypeName::Timestamp,
+            MessageValue::Timeuuid(_) => DataTypeName::TimeUuid,
+            MessageValue::Varchar(_) => DataTypeName::VarChar,
+            MessageValue::Uuid(_) => DataTypeName::Uuid,
+            MessageValue::Time(_) => DataTypeName::Time,
+            MessageValue::Counter(_) => DataTypeName::Counter,
+            MessageValue::Tuple(_) => DataTypeName::Tuple,
+            MessageValue::Udt(_) => DataTypeName::Tuple,
+            MessageValue::NULL => DataTypeName::Custom("NULL".to_string()),
+            MessageValue::None => DataTypeName::Custom("None".to_string()),
         }
     }
 }
@@ -574,7 +670,7 @@ impl MessageValue {
         wrapper(data, col_type).unwrap()
     }
 
-    fn create_element(element: CassandraType) -> MessageValue {
+    pub fn create_element(element: CassandraType) -> MessageValue {
         match element {
             CassandraType::Ascii(a) => MessageValue::Ascii(a),
             CassandraType::Bigint(b) => MessageValue::Integer(b, IntSize::I64),
@@ -630,39 +726,6 @@ impl MessageValue {
                 MessageValue::Tuple(value_list)
             }
             CassandraType::Null => MessageValue::NULL,
-        }
-    }
-
-    pub fn into_str_bytes(self) -> Bytes {
-        match self {
-            MessageValue::NULL => Bytes::from("".to_string()),
-            MessageValue::None => Bytes::from("".to_string()),
-            MessageValue::Bytes(b) => b,
-            MessageValue::Strings(s) => Bytes::from(s),
-            MessageValue::Integer(i, _) => Bytes::from(format!("{i}")),
-            MessageValue::Float(f) => Bytes::from(format!("{f}")),
-            MessageValue::Boolean(b) => Bytes::from(format!("{b}")),
-            MessageValue::Inet(i) => Bytes::from(format!("{i}")),
-            MessageValue::FragmentedResponse(_) => unimplemented!(),
-            MessageValue::Document(_) => unimplemented!(),
-            MessageValue::NamedRows(_) => unimplemented!(),
-            MessageValue::List(_) => unimplemented!(),
-            MessageValue::Rows(_) => unimplemented!(),
-            MessageValue::Ascii(_) => unimplemented!(),
-            MessageValue::Double(_) => unimplemented!(),
-            MessageValue::Set(_) => unimplemented!(),
-            MessageValue::Map(_) => unimplemented!(),
-            MessageValue::Varint(_) => unimplemented!(),
-            MessageValue::Decimal(_) => unimplemented!(),
-            MessageValue::Date(_) => unimplemented!(),
-            MessageValue::Timestamp(_) => unimplemented!(),
-            MessageValue::Timeuuid(_) => unimplemented!(),
-            MessageValue::Varchar(_) => unimplemented!(),
-            MessageValue::Uuid(_) => unimplemented!(),
-            MessageValue::Time(_) => unimplemented!(),
-            MessageValue::Counter(_) => unimplemented!(),
-            MessageValue::Tuple(_) => unimplemented!(),
-            MessageValue::Udt(_) => unimplemented!(),
         }
     }
 }

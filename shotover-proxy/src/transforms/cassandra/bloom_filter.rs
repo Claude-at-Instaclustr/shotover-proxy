@@ -1,52 +1,28 @@
-//use reduce::Reduce;
-use crate::error::ChainResponse;
-use crate::message;
 use crate::message::{Message, MessageValue, Messages};
-use crate::transforms::{Transform, Transforms, Wrapper};
-use async_trait::async_trait;
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::BigDecimal;
 use bloomfilter::bloomfilter::bitmap_producer::BitMapProducer;
-use bloomfilter::bloomfilter::hasher::{Hasher, HasherCollection, HasherType, SimpleHasher};
+use bloomfilter::bloomfilter::hasher::{Hasher, HasherType, SimpleHasher};
 use bloomfilter::bloomfilter::{BloomFilter, BloomFilterType, Shape, Simple};
-use bytes::{Buf, Bytes};
+use bytes::{Bytes};
 use cassandra_protocol::frame::frame_error::{AdditionalErrorInfo, ErrorBody};
-use cassandra_protocol::frame::frame_result::ColType::Udt;
 use cassandra_protocol::frame::frame_result::{ColSpec, RowsMetadata};
-use cassandra_protocol::frame::{Frame, StreamId, Version};
-use cassandra_protocol::query::QueryParams;
-use itertools::Itertools;
-use metrics::{counter, register_counter, Unit};
+use cassandra_protocol::frame::{StreamId, Version};
 use murmur3::murmur3_x64_128;
 use ordered_float::OrderedFloat;
-use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::fmt::LowerHex;
 use std::io::Cursor;
-use std::iter::Map;
-use std::net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr};
 use std::str::FromStr;
-use std::string::FromUtf8Error;
-use std::time::Duration;
 use cql3_parser::cassandra_ast::CassandraAST;
 use cql3_parser::cassandra_statement::CassandraStatement;
-use cql3_parser::common::{Operand, RelationElement, RelationOperator};
+use cql3_parser::common::{FQName, Operand, RelationElement, RelationOperator};
 use cql3_parser::select::{Named, SelectElement,Select};
-use tls_parser::nom::AsBytes;
-
-use crate::codec::cassandra::CassandraCodec;
+use itertools::Itertools;
 use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, CQL};
-use tokio::io::AsyncReadExt;
-use tokio::sync::oneshot::Receiver;
-use tokio::time::timeout;
-use tracing::{info, trace};
-use tree_sitter::{
-    Language, LogType, Node, Parser, Query, QueryCapture, QueryCursor, QueryMatch, Tree, TreeCursor,
-};
 use uuid::Uuid;
-
-//use proc_macro::TokenTree;
+use crate::frame::cassandra::CQLStatement;
 use crate::frame::CassandraOperation::Error;
 
 
@@ -76,7 +52,7 @@ pub struct CassandraBloomFilter {
     chain_name: String,
     /// a mapping of fully qualified table names to configurations.
     /// Fully qualified => keyspace . table
-    tables: HashMap<String, CassandraBloomFilterTableConfig>,
+    tables: HashMap<FQName, CassandraBloomFilterTableConfig>,
     /// a mapping of messages by stream id.
     messages: HashMap<StreamId, BloomFilterState>,
 }
@@ -89,7 +65,7 @@ impl Clone for CassandraBloomFilter {
 
 impl CassandraBloomFilter {
     pub fn new(
-        tables: &HashMap<String, CassandraBloomFilterTableConfig>,
+        tables: &HashMap<FQName, CassandraBloomFilterTableConfig>,
         chain_name: String,
     ) -> CassandraBloomFilter {
         let sink_single = CassandraBloomFilter {
@@ -138,7 +114,7 @@ impl CassandraBloomFilter {
             tracing_id: original_frame.tracing_id,
             warnings: original_frame.warnings.clone(),
             operation: CassandraOperation::Query {
-                query: CQL::parse_from_string(new_query),
+                query: CQL::parse_from_string(&new_query),
                 params: Default::default(),
             },
         };
@@ -149,45 +125,47 @@ impl CassandraBloomFilter {
     /// process the query message.  This method has to handle all possible Queries that could
     /// impact the Bloom filter.
     fn process_query(&self, state: &mut BloomFilterState) -> Option<Message> {
-        match &state.statement {
-            CassandraStatement::Select(statement_data) => {
-                let table_name = state.fixup_table_name(statement_data.table_name.clone());
-                let cfg = self.tables.get(&table_name);
-                match cfg {
-                    None => {
-                        state.ignore = true;
-                        None
-                    }
-                    Some(config) => {
-                        let mut select_data = statement_data.clone();
-                        select_data.table_name = table_name;
-                        let result =
-                            CassandraBloomFilter::process_select(state, config, &select_data);
-                        if result.is_err() {
-                            self.make_error(state, result.err().unwrap())
-                        } else {
-                            match result.unwrap() {
-                                Some(new_select) => {
-                                    self.make_response(state, new_select.to_string())
+            match &state.statement.statement {
+                CassandraStatement::Select(statement_data) => {
+                    let table_name = state.fixup_table_name(&statement_data.table_name);
+                    let cfg = self.tables.get(&table_name);
+                    match cfg {
+                        None => {
+                            state.ignore = true;
+                            None
+                        }
+                        Some(config) => {
+                            let mut select_data = statement_data.clone();
+                            select_data.table_name = table_name;
+                            let result =
+                                CassandraBloomFilter::process_select(state, config, &select_data);
+                            if result.is_err() {
+                                self.make_error(state, result.err().unwrap())
+                            } else {
+                                match result.unwrap() {
+                                    Some(new_select) => {
+                                        self.make_response(state, new_select.to_string())
+                                    }
+                                    None => None,
                                 }
-                                None => None,
                             }
                         }
                     }
                 }
-            }
-            CassandraStatement::Use(keyspace) => {
-                state.default_keyspace = Some(keyspace.clone());
-                None
-            }
-            /*  InsertStatement => self.process_insert(ast, state),
+                CassandraStatement::Use(keyspace) => {
+                    state.default_keyspace = Some(keyspace.clone());
+                    None
+                }
+                /*  InsertStatement => self.process_insert(ast, state),
             DeleteStatement => self.process_delete(ast, state),
             UseStatement => { self.process_use( ast, state); None},*/
-            _ => {
-                state.ignore = true;
-                None
+                _ => {
+                    state.ignore = true;
+                    None
+                }
             }
-        }
+
+
     }
     /*
         fn process_insert(&self, ast : & CassandraAST, state : &mut BloomFilterState ) -> Option<Message> {
@@ -332,14 +310,16 @@ impl CassandraBloomFilter {
         // add the where clause bloom filter columns to the select so we can filter later
 
         // the columns we are interested in are in the where clause
-        let column_names = select_data.where_columns();
+        // we use this later
+        let column_names = select_data.where_clause.iter().filter_map(|re|
+        if let Operand::Column( name ) = &re.obj {
+            Some(name)
+        } else { None })
+            .collect_vec();
         // get a list of all the column names.
         // see if some of the columns are in the bloom filter configuration.
-        let some_columns: bool = column_names
-            .iter()
-            .map(|c| config.columns.contains(c))
-            .reduce(|a, b| a || b)
-            .unwrap();
+        let some_columns: bool = column_names.iter()
+            .filter(|c| config.columns.contains(c)).next().is_some();
 
         if some_columns {
             // hashers for building bloom filter
@@ -349,20 +329,16 @@ impl CassandraBloomFilter {
             // we will assume that the user knows what they want and not touch the filter but will
             // remove the columns from the query so the query will execute.  We will add the columns
             // to the selected columns
-            let has_filter = column_names.contains(&config.bloom_column);
+            let has_filter = column_names.contains(&&config.bloom_column);
 
-            if select_data.where_clause.is_some()
+            if ! select_data.where_clause.is_empty()
                 && select_data
                     .where_clause
-                    .as_ref()
-                    .unwrap()
                     .iter()
-                    .map(|re| match &re.obj {
+                    .filter(|re| match &re.obj {
                         Operand::List(_) => true,
                         _ => false,
-                    })
-                    .reduce(|a, b| (a | b))
-                    .unwrap()
+                    }).next().is_some()
             {
                 return Err(
                     "bloom filter processing does not yet support (column...) = (values...)"
@@ -370,21 +346,13 @@ impl CassandraBloomFilter {
                 );
             }
 
-            let interesting_relations: Vec<&RelationElement> = if select_data.where_clause.is_some()
-            {
-                select_data
-                    .where_clause
-                    .as_ref()
-                    .unwrap()
+            let interesting_relations: Vec<&RelationElement> = select_data.where_clause
                     .iter()
                     .filter(|re| match &re.obj {
                         Operand::Column(name) => !(has_filter && name.eq(&config.bloom_column)),
                         _ => false,
                     })
-                    .collect()
-            } else {
-                vec![]
-            };
+                    .collect_vec();
 
             state.ignore = false;
             let selected_columns = select_data.select_names();
@@ -410,9 +378,7 @@ impl CassandraBloomFilter {
                         }));
                         if !has_filter {
                             // only get here if we have equality statement and no filter defined
-                            for x in &relation.value {
-                                hashers.push(CassandraBloomFilter::make_hasher(x.to_string()));
-                            }
+                            hashers.push(CassandraBloomFilter::make_hasher(relation.value.to_string()));
                         }
                     }
                     _ => (),
@@ -442,11 +408,7 @@ impl CassandraBloomFilter {
                 let where_stmt = RelationElement {
                     obj: Operand::Column(config.bloom_column.clone()),
                     oper: RelationOperator::Equal,
-                    value: {
-                        let mut result = vec![];
-                        result.push(Operand::Const(CassandraBloomFilter::as_hex(&filter)));
-                        result
-                    },
+                    value: Operand::Const(CassandraBloomFilter::as_hex(&filter)),
                 };
                 state.added_where.push(where_stmt);
             }
@@ -627,7 +589,7 @@ impl CassandraBloomFilter {
         than a single value we can fail
          */
 
-        let relation_value = relation_element.first_value().to_string();
+        let relation_value = relation_element.to_string();
 
         // convert relation_element message value  Can not use from as relation element does not
         // have enough data.
@@ -646,17 +608,17 @@ impl CassandraBloomFilter {
             | MessageValue::Time(i)
             | MessageValue::Counter(i) => match relation_value.parse::<i64>() {
                 Ok(v) => relation_element.oper.eval(i, &v),
-                Err(e) => false,
+                Err(_e) => false,
             },
 
             MessageValue::Double(d) => match relation_value.parse::<f64>() {
                 Ok(v) => relation_element.oper.eval(d, &OrderedFloat(v)),
-                Err(e) => false,
+                Err(_e) => false,
             },
 
             MessageValue::Float(f) => match relation_value.parse::<f32>() {
                 Ok(v) => relation_element.oper.eval(f, &OrderedFloat(v)),
-                Err(e) => false,
+                Err(_e) => false,
             },
 
             MessageValue::Boolean(b) => {
@@ -666,28 +628,28 @@ impl CassandraBloomFilter {
 
             MessageValue::Inet(ipaddr) => match IpAddr::from_str(relation_value.as_str()) {
                 Ok(v) => relation_element.oper.eval(ipaddr, &v),
-                Err(e) => false,
+                Err(_e) => false,
             },
 
             MessageValue::Varint(i) => match relation_value.parse::<BigInt>() {
                 Ok(v) => relation_element.oper.eval(i, &v),
-                Err(e) => false,
+                Err(_e) => false,
             },
 
             MessageValue::Decimal(d) => match relation_value.parse::<BigDecimal>() {
                 Ok(v) => relation_element.oper.eval(d, &v),
-                Err(e) => false,
+                Err(_e) => false,
             },
 
             MessageValue::Date(i) => match relation_value.parse::<i32>() {
                 Ok(v) => relation_element.oper.eval(i, &v),
-                Err(e) => false,
+                Err(_e) => false,
             },
 
             MessageValue::Timeuuid(u) | MessageValue::Uuid(u) => {
                 match Uuid::parse_str(relation_value.as_str()) {
                     Ok(v) => relation_element.oper.eval(u, &v),
-                    Err(e) => false,
+                    Err(_e) => false,
                 }
             }
 
@@ -856,7 +818,7 @@ impl CassandraBloomFilter {
 
 #[derive(Debug, Clone)]
 pub struct BloomFilterState {
-    statement: CassandraStatement,
+    statement: CQLStatement,
     ignore: bool,
     original_msg: Option<Message>,
     verify_funcs: Vec<RelationElement>,
@@ -868,9 +830,9 @@ pub struct BloomFilterState {
 
 impl BloomFilterState {
     /// create a new BloomFilterState
-    pub fn new(ast: &CassandraAST, msg: Option<Message>) -> BloomFilterState {
+    pub fn new(statement: CQLStatement, msg: Option<Message>) -> BloomFilterState {
         BloomFilterState {
-            statement: ast.statement.clone(),
+            statement,
             ignore: false,
             original_msg: msg,
             verify_funcs: vec![],
@@ -882,11 +844,17 @@ impl BloomFilterState {
     }
 
     /// converts to lower case and adds default_keyspace if defined and keyspace not specified.
-    pub fn fixup_table_name(&self, table_name: String) -> String {
-        if self.default_keyspace.is_none() || table_name.contains(".") {
-            table_name.to_lowercase()
+    pub fn fixup_table_name(&self, table_name: &FQName) -> FQName {
+        if self.default_keyspace.is_none() || table_name.keyspace.is_some() {
+            FQName{
+                keyspace: if table_name.keyspace.is_some() { Some( table_name.keyspace.as_ref().unwrap().to_lowercase())} else {None},
+                name : table_name.name.to_lowercase(),
+            }
         } else {
-            format!("{}.{}", self.default_keyspace.as_ref().unwrap(), table_name).to_lowercase()
+            FQName {
+                keyspace: Some(self.default_keyspace.as_ref().unwrap().to_lowercase()),
+                name: table_name.name.to_lowercase()
+            }
         }
     }
 
@@ -915,27 +883,21 @@ impl BloomFilterState {
         let mut new_where: Vec<RelationElement> = vec![];
 
         // add the where clauses that were not moved to verify_funcs.
-        if select_data.where_clause.as_ref().is_some() {
+
             select_data
                 .where_clause
-                .as_ref()
-                .unwrap()
                 .iter()
                 .filter(|f| !self.verify_funcs.contains(f))
                 .for_each(|w| new_where.push(w.clone()));
-        }
+
         self.added_where
             .iter()
             .for_each(|w| new_where.push(w.clone()));
 
-        let mut result = Select {
+        let result = Select {
             distinct: select_data.distinct,
             table_name: select_data.table_name.clone(),
-            where_clause: if new_where.is_empty() {
-                None
-            } else {
-                Some(new_where)
-            },
+            where_clause: new_where,
             order: match &select_data.order {
                 None => None,
                 Some(x) => Some(x.clone()),
@@ -982,8 +944,9 @@ mod test {
     use std::collections::HashMap;
     use cql3_parser::cassandra_ast::CassandraAST;
     use cql3_parser::cassandra_statement::CassandraStatement;
-    use cql3_parser::common::{Operand, RelationElement, RelationOperator};
+    use cql3_parser::common::{FQName, Operand, RelationElement, RelationOperator};
     use cql3_parser::select::{Named, Select, SelectElement};
+    use crate::frame::cassandra::CQLStatement;
 
     pub fn build_message(select_stmt: &String) -> Message {
         let frame = CassandraFrame {
@@ -992,16 +955,16 @@ mod test {
             tracing_id: None,
             warnings: vec![],
             operation: Query {
-                query: CQL::parse_from_string(select_stmt.clone()),
+                query: CQL::parse_from_string(select_stmt),
                 params: Default::default(),
             },
         };
         Message::from_frame(Cassandra(frame))
     }
 
-    fn build_state(ast: &CassandraAST, msg: Message) -> BloomFilterState {
+    fn build_state(statement : &CQLStatement, msg: Message) -> BloomFilterState {
         BloomFilterState {
-            statement: ast.statement.clone(),
+            statement : statement.clone(),
             ignore: false,
             original_msg: Some(msg),
             verify_funcs: vec![],
@@ -1013,11 +976,11 @@ mod test {
     }
 
     fn get_select_result(
-        ast: &CassandraAST,
+        statement : &CQLStatement,
         state: &mut BloomFilterState,
         config: &CassandraBloomFilterTableConfig,
     ) -> Option<Select> {
-        let result = match &ast.statement {
+        let result = match &statement.statement {
             CassandraStatement::Select(select_data) => {
                 CassandraBloomFilter::process_select(state, &config, &select_data)
             }
@@ -1043,12 +1006,13 @@ mod test {
         };
 
         let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 = 'bar'".to_string();
-        let ast = CassandraAST::new(select_stmt.clone());
-
         let msg = build_message(&select_stmt);
-        let mut state = build_state(&ast, msg);
 
-        let result = get_select_result(&ast, &mut state, &config);
+        let cql = CQL::parse_from_string( &select_stmt );
+        let statement = &*cql.statements[0];
+        let mut state = build_state( statement, msg);
+
+        let result = get_select_result(statement, &mut state, &config);
 
         let expected_select = SelectElement::Column(Named {
             name: "bfCol1".to_string(),
@@ -1058,11 +1022,7 @@ mod test {
         let expected_verify = RelationElement {
             obj: Operand::Column("bfCol1".to_string()),
             oper: RelationOperator::Equal,
-            value: {
-                let mut v = vec![];
-                v.push(Operand::Const("'bar'".to_string()));
-                v
-            },
+            value: Operand::Const("'bar'".to_string()),
         };
 
         match result {
@@ -1085,10 +1045,10 @@ mod test {
 
         // verify original was not changed
         let mut msg = state.original_msg.as_ref().unwrap().clone();
-        let mut cassandra_frame = msg.frame().unwrap().clone().into_cassandra().unwrap();
+        let cassandra_frame = msg.frame().unwrap().clone().into_cassandra().unwrap();
 
         match cassandra_frame.operation {
-            CassandraOperation::Query { query, params } => {
+            CassandraOperation::Query { query, .. } => {
                 assert_eq!(select_stmt, query.to_query_string());
             }
             _ => assert!(false),
@@ -1107,12 +1067,13 @@ mod test {
         };
 
         let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 <> 'bar' and filterColumn = 0X02000000000020000000000000000080".to_string();
-        let ast = CassandraAST::new(select_stmt.clone());
-
         let msg = build_message(&select_stmt);
-        let mut state = build_state(&ast, msg);
 
-        let result = get_select_result(&ast, &mut state, &config);
+        let cql = CQL::parse_from_string( &select_stmt );
+        let statement = &*cql.statements[0];
+        let mut state = build_state( statement, msg);
+
+        let result = get_select_result(statement, &mut state, &config);
 
         let expected_select = SelectElement::Column(Named {
             name: "bfCol1".to_string(),
@@ -1122,11 +1083,7 @@ mod test {
         let expected_verify = RelationElement {
             obj: Operand::Column("bfCol1".to_string()),
             oper: RelationOperator::NotEqual,
-            value: {
-                let mut v = vec![];
-                v.push(Operand::Const("'bar'".to_string()));
-                v
-            },
+            value: Operand::Const("'bar'".to_string()),
         };
 
         match result {
@@ -1156,27 +1113,29 @@ mod test {
         };
 
         let select_stmt = "SELECT foo FROM myTable WHERE junk <> 'bar'".to_string();
-        let ast = CassandraAST::new(select_stmt.clone());
-
         let msg = build_message(&select_stmt);
-        let mut state = build_state(&ast, msg);
 
-        let result = get_select_result(&ast, &mut state, &config);
+        let cql = CQL::parse_from_string( &select_stmt );
+        let statement = &*cql.statements[0];
+        let mut state = build_state( statement, msg);
+
+        let result = get_select_result(statement, &mut state, &config);
 
         match result {
             None => assert_eq!(true, state.ignore),
-            Some(statement_data) => assert!(false),
+            Some(_) => assert!(false),
         }
     }
 
     #[test]
     pub fn test_use_modifies_select() {
         let select_stmt = "use HELLO".to_string();
-        let ast = CassandraAST::new(select_stmt.clone());
+        let cql = CQL::parse_from_string( &select_stmt );
+        let statement = &*cql.statements[0];
+        let mut tables: HashMap<FQName, CassandraBloomFilterTableConfig> = HashMap::new();
 
-        let mut tables: HashMap<String, CassandraBloomFilterTableConfig> = HashMap::new();
         tables.insert(
-            "hello.mytable".to_string(),
+            FQName::new("hello", "mytable"),
             CassandraBloomFilterTableConfig {
                 keyspace: "".to_string(),
                 table: "myTable".to_string(),
@@ -1189,18 +1148,19 @@ mod test {
 
         let filter = CassandraBloomFilter::new(&tables, "testing_chain".to_string());
 
-        let mut state = BloomFilterState::new(&ast, None);
+        let mut state = BloomFilterState::new(statement.clone(), None);
 
         let msg = filter.process_query(&mut state);
         assert_eq!(None, msg);
         assert_eq!(
-            "hello.mytable",
-            state.fixup_table_name("MyTable".to_string())
-        );
+            FQName::new( "hello","mytable"),
+            state.fixup_table_name(&FQName::simple("MyTable")));
 
         let select_stmt = "select * from mytable where bfCol1 = 'foo'".to_string();
-        let ast = CassandraAST::new(select_stmt.clone());
-        state.statement = ast.statement.clone();
+        let cql = CQL::parse_from_string( &select_stmt );
+        let statement = &*cql.statements[0];
+
+        state.statement = statement.clone();
         state.original_msg = Some(build_message(&select_stmt));
 
         let msg = filter.process_query(&mut state);
@@ -1208,14 +1168,17 @@ mod test {
             Some(mut m) => {
                 let y = m.frame().unwrap().clone().into_cassandra().unwrap();
                 let z = match y.operation {
-                    CassandraOperation::Query { query, params } => query.to_query_string(),
+                    CassandraOperation::Query { query, .. } => query.to_query_string(),
                     _ => "ERROR".to_string(),
                 };
-                let new_ast = CassandraAST::new(z);
-                assert!(!new_ast.has_error());
+                let cql = CQL::parse_from_string( &z );
+                assert!(!cql.has_error );
+
+                let statement = &*cql.statements[0];
+                assert!( !statement.has_error );
                 assert_eq!(
                     "SELECT * FROM hello.mytable WHERE filterColumn = 0X0200000008000040",
-                    new_ast.statement.to_string()
+                    statement.to_string()
                 );
             }
             None => assert!(false),
@@ -1225,11 +1188,12 @@ mod test {
     #[test]
     pub fn test_limit_removed_when_select_processed() {
         let select_stmt = "use HELLO".to_string();
-        let ast = CassandraAST::new(select_stmt.clone());
+        let cql = CQL::parse_from_string( &select_stmt );
+        let statement = &*cql.statements[0];
 
-        let mut tables: HashMap<String, CassandraBloomFilterTableConfig> = HashMap::new();
+        let mut tables: HashMap<FQName, CassandraBloomFilterTableConfig> = HashMap::new();
         tables.insert(
-            "hello.mytable".to_string(),
+            FQName::new("hello","mytable"),
             CassandraBloomFilterTableConfig {
                 keyspace: "".to_string(),
                 table: "myTable".to_string(),
@@ -1242,18 +1206,19 @@ mod test {
 
         let filter = CassandraBloomFilter::new(&tables, "testing_chain".to_string());
 
-        let mut state = BloomFilterState::new(&ast, None);
+        let mut state = BloomFilterState::new(statement.clone(), None);
 
         let msg = filter.process_query(&mut state);
         assert_eq!(None, msg);
         assert_eq!(
-            "hello.mytable",
-            state.fixup_table_name("MyTable".to_string())
+            FQName::new("hello","mytable"),
+            state.fixup_table_name(&FQName::simple("MyTable"))
         );
 
         let select_stmt = "select * from mytable where bfCol1 = 'foo' LIMIT 5".to_string();
-        let ast = CassandraAST::new(select_stmt.clone());
-        state.statement = ast.statement.clone();
+        let cql = CQL::parse_from_string( &select_stmt );
+        let statement = &*cql.statements[0];
+        state.statement = statement.clone();
         state.original_msg = Some(build_message(&select_stmt));
 
         let msg = filter.process_query(&mut state);
@@ -1264,11 +1229,12 @@ mod test {
                     CassandraOperation::Query { query, params } => query.to_query_string(),
                     _ => "ERROR".to_string(),
                 };
-                let new_ast = CassandraAST::new(z);
-                assert!(!new_ast.has_error());
+                let cql = CQL::parse_from_string( &z );
+                let statement = &*cql.statements[0];
+                assert!(!statement.has_error);
                 assert_eq!(
                     "SELECT * FROM hello.mytable WHERE filterColumn = 0X0200000008000040",
-                    new_ast.statement.to_string()
+                    statement.to_string()
                 );
             }
             None => assert!(false),
@@ -1331,11 +1297,7 @@ mod test {
         verify_funcs.push(RelationElement {
             obj: Operand::Column("bfCol".to_string()),
             oper: RelationOperator::LessThan,
-            value: {
-                let mut v = vec![];
-                v.push(Operand::Const("10".to_string()));
-                v
-            },
+            value: Operand::Const("10".to_string()),
         });
 
         let mut added_selects = vec![];
@@ -1345,7 +1307,10 @@ mod test {
         }));
 
         let mut state = BloomFilterState {
-            statement: CassandraStatement::Unknown("dummy".to_string()),
+            statement: CQLStatement {
+                statement: CassandraStatement::Unknown("dummy".to_string()),
+                has_error: false
+            },
             ignore: false,
             original_msg: None,
             verify_funcs,
