@@ -20,6 +20,7 @@ use cql3_parser::cassandra_statement::CassandraStatement;
 use cql3_parser::common::{FQName, Operand, RelationElement, RelationOperator};
 use cql3_parser::select::{Named, SelectElement,Select};
 use itertools::Itertools;
+use tracing_log::log::{info, warn};
 use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, CQL};
 use uuid::Uuid;
 use crate::frame::cassandra::CQLStatement;
@@ -313,7 +314,7 @@ impl CassandraBloomFilter {
         // we use this later
         let column_names = select_data.where_clause.iter().filter_map(|re|
         if let Operand::Column( name ) = &re.obj {
-            Some(name)
+            Some(name.clone())
         } else { None })
             .collect_vec();
         // get a list of all the column names.
@@ -329,7 +330,7 @@ impl CassandraBloomFilter {
             // we will assume that the user knows what they want and not touch the filter but will
             // remove the columns from the query so the query will execute.  We will add the columns
             // to the selected columns
-            let has_filter = column_names.contains(&&config.bloom_column);
+            let has_filter = column_names.contains(&config.bloom_column);
 
             if ! select_data.where_clause.is_empty()
                 && select_data
@@ -506,17 +507,19 @@ impl CassandraBloomFilter {
                     .verify_funcs
                     .iter()
                     .map(|re| {
-                        let name = match &re.obj {
-                            Operand::Column(name) => name,
-                            _ => unreachable!(),
-                        };
-                        for i in 0..metadata.columns_count {
-                            let colspec: &ColSpec = metadata.col_specs.get(i as usize).unwrap();
-                            if colspec.name.eq(name) {
-                                return (i as usize, re);
+                        if let Operand::Column(name) = &re.obj {
+                            for idx in 0..metadata.columns_count {
+                                let colspec: &ColSpec = metadata.col_specs.get(idx as usize ).unwrap();
+                                let d = colspec.name.eq( name );
+                                if colspec.name.eq(name) {
+                                    return (idx as usize, re);
+                                }
                             }
                         }
                         unreachable!()
+
+
+
                     })
                     .for_each(|(x, y)| verify_map.push((x, y)));
                 let mut filtered_rows = vec![];
@@ -589,7 +592,7 @@ impl CassandraBloomFilter {
         than a single value we can fail
          */
 
-        let relation_value = relation_element.to_string();
+        let relation_value = relation_element.value.to_string();
 
         // convert relation_element message value  Can not use from as relation element does not
         // have enough data.
@@ -904,7 +907,7 @@ impl BloomFilterState {
             },
             limit: None,
             json: select_data.json,
-            columns: select_data.columns.clone(),
+            columns: new_elements,
             filtering: select_data.filtering
         };
         result
