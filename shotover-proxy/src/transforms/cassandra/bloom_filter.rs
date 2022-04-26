@@ -1,8 +1,7 @@
 use crate::message::{Message, MessageValue, Messages};
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::BigDecimal;
-use bloomfilter::bloomfilter::bitmap_producer::BitMapProducer;
-use bloomfilter::bloomfilter::hasher::{Hasher, HasherType, SimpleHasher};
+use bloomfilter::bloomfilter::hasher::{HasherType, SimpleHasher};
 use bloomfilter::bloomfilter::{BloomFilter, BloomFilterType, Shape, Simple};
 use bytes::{Bytes};
 use cassandra_protocol::frame::frame_error::{AdditionalErrorInfo, ErrorBody};
@@ -15,16 +14,16 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::{IpAddr};
 use std::str::FromStr;
-use cql3_parser::cassandra_ast::CassandraAST;
 use cql3_parser::cassandra_statement::CassandraStatement;
 use cql3_parser::common::{FQName, Operand, RelationElement, RelationOperator};
 use cql3_parser::select::{Named, SelectElement,Select};
 use itertools::Itertools;
-use tracing_log::log::{info, warn};
-use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, CQL};
+use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, CQL, Frame};
 use uuid::Uuid;
+use crate::error::ChainResponse;
 use crate::frame::cassandra::CQLStatement;
 use crate::frame::CassandraOperation::Error;
+use crate::transforms::{Transform, Wrapper};
 
 
 /// The configuration for a single bloom filter in a single table.
@@ -79,7 +78,7 @@ impl CassandraBloomFilter {
         sink_single
     }
 
-    fn get_name(&self) -> &'static str {
+    pub fn get_name(&self) -> &'static str {
         "CassandraBloomFilter"
     }
 
@@ -168,122 +167,7 @@ impl CassandraBloomFilter {
 
 
     }
-    /*
-        fn process_insert(&self, ast : & CassandraAST, state : &mut BloomFilterState ) -> Option<Message> {
-            let cfg = self.check_table_name( ast, state );
-            match cfg {
-                None => None,
-                Some(config) => {
-                    // we need to determine if the bloom filter is being updated if any of the
-                    // affected nodes are also updated.
-                    // this is not quite accurate as we do not deal with simultaneous updates
-                    let nodes: Box<Vec<Node>> = ast.search( "insert_column_spec / column_list / column" );
-                    if nodes.is_empty() {
-                        return self.make_error( state, "columns must be specified in inserts for Bloom filter based tables");
-                    }
-                    // the names of the column
-                    let columns : Vec<String> = nodes.iter().map( |n| ast.node_text(n) ).collect();
-                    let some_columns : bool = columns.iter().map( |c| config.columns.contains( c )).reduce( |a,b|  a || b)?;
-                    let all_columns : bool = columns.iter().map( |c| config.columns.contains( c )).reduce( |a,b|  a && b)?;
-                    let has_filter = columns.contains( &config.bloom_column);
-                    // cases to check
-                    // none of the columns -> ok
-                    // has filter -> ok
-                    // some but not all columns  -> error
-                    // all columns and not bloom filter -> add bloom filter
-                    // all columns and bloom filter -> ok
-                    if !some_columns || has_filter {
-                        state.ignore = true;
-                        return None
-                    }
 
-                    // some but not all and no filter
-                    if !all_columns {
-                        return self.make_error( state, "modifying some but not all bloom filter columns requires updating filter" );
-                    }
-                    // all the columns in the filter are being inserted and there is no bloom filter provided
-                    // so build the filter
-                    let insert_values_spec = ast.search( "insert_values_spec" );
-
-                        let insert_values_spec_node = insert_values_spec.get(0).unwrap();
-                        if insert_values_spec_node.child(0).unwrap().kind().eq("JSON") {
-                            return self.make_error(state, "column values may not be set with JSON in inserts for Bloom filter based tables");
-                        }
-
-                    let mut hashers = vec!();
-                    //let mut hashers = Box::new(HasherCollection::new());
-
-                    // assignment_map|assignment_list|assignment_set|assignment_tuple
-
-                    let expressions: Box<Vec<Node>> = CassandraAST::search_node(insert_values_spec_node, "expression_list / expression" );
-
-                    // there should be one expression for each column
-                    if expressions.len() != columns.len() {
-                        return self.make_error( state, "not enough values for the columns");
-                    }
-                    for i in 0..expressions.len() {
-                        if config.columns.contains( columns.get(i).unwrap() ) {
-                            let expr = expressions.get(i).unwrap();
-                            if CassandraAST::has_node(expr, "assignment_map|assignment_list|assignment_set|assignment_tuple") {
-                                return self.make_error( state, "assignment maps, lists, sets or tuples may not be used to specify values for bloom filter columns.");
-                            }
-                            hashers.push( CassandraBloomFilter::make_hasher( ast.node_text( expr )));
-                        }
-                    }
-                    let shape = Shape {
-                        m: config.bits,
-                        k: config.funcs,
-                    };
-                    //let hasher:HasherType = Box::new(hashers);
-                    let mut filter = Simple::empty_instance( &shape );
-                    for hasher in hashers {
-                        filter.merge_hasher_in_place( &hasher );
-                    }
-                    state.added_values.push( (config.bloom_column.clone(), CassandraBloomFilter::as_hex( &filter )));
-                    // TODO continue implementation
-                    None
-                }
-            }
-        }
-    */
-    /*fn check_table_name( &self, ast : & CassandraAST, state : &mut BloomFilterState ) -> Option<&CassandraBloomFilterTableConfig> {
-            let table_name = ast.get_table_name( &state.default_keyspace);
-            let cfg = self.tables.get( table_name.as_str() );
-            state.ignore = cfg.is_none();
-            cfg
-        }
-    */
-    /*
-        fn process_delete( &self, ast : & CassandraAST, state : &mut BloomFilterState ) -> Option<Message> {
-            let cfg = self.check_table_name( ast, state );
-            match cfg {
-                None => None,
-                Some(config) => {
-                    // we need to determine if bloom filter columns are being deleted and the
-                    // bloom filter not updated
-                    let nodes: Box<Vec<Node>> = ast.search( "delete_column_list / column" );
-                    let columns : Vec<String> = nodes.iter().map( |n| ast.node_text(n) ).collect();
-                    let some_columns : bool = columns.iter().map( |c| config.columns.contains( c )).reduce( |a,b|  a || b)?;
-                    let all_columns : bool = columns.iter().map( |c| config.columns.contains( c )).reduce( |a,b|  a && b)?;
-                    let has_filter = columns.contains( &config.bloom_column);
-                    // cases to check
-                    // none of the columns -> ok
-                    // some of the columns and bloom filter -> ok
-                    // otherwise error
-                    if !some_columns || has_filter {
-                        return None
-                    }
-                    return self.make_error( state, "deleting bloom filter columns requires deleting filter");
-                }
-            }
-        }
-
-        fn process_use(&self, ast: & CassandraAST, state : &mut BloomFilterState) {
-            // structure should be (source_file (use))
-            let keyspace = ast.search( "keyspace");
-            state.default_keyspace = Some(ast.node_text( keyspace.get(0).unwrap()) );
-        }
-    */
     fn make_error(&self, state: &mut BloomFilterState, message: String) -> Option<Message> {
         let mut msg = state.original_msg.as_ref().unwrap().clone();
         let mut cassandra_frame = msg.frame().unwrap().clone().into_cassandra().unwrap();
@@ -428,29 +312,6 @@ impl CassandraBloomFilter {
         hex
     }
 
-    /*
-    fn node_filter_print( &self,ast : CassandraAST, node : &node, moved_columns : Vec<String> ) {
-        moved_columns
-        if (node.kind() == )
-    }
-    */
-
-    /*
-        fn remove_unwanted_data( row_data : &mut Vec<HashMap<String,Value>>, &old_msg : &QueryMessage) {
-            row_data.retain( |mut row| {
-                for (name, expected) in old_msg.query_values?.keys() {
-                    if row.get(name) != expected {
-                        return false;
-                    }
-                    if ! old_msg.projection?.contains( name ) {
-                        row.remove( name );
-                    }
-                }
-                true
-            };
-        }
-    */
-
     /// process a result message
     fn process_result(
         &mut self,
@@ -510,7 +371,6 @@ impl CassandraBloomFilter {
                         if let Operand::Column(name) = &re.obj {
                             for idx in 0..metadata.columns_count {
                                 let colspec: &ColSpec = metadata.col_specs.get(idx as usize ).unwrap();
-                                let d = colspec.name.eq( name );
                                 if colspec.name.eq(name) {
                                     return (idx as usize, re);
                                 }
@@ -722,101 +582,41 @@ impl CassandraBloomFilter {
          */
         messages
     }
+}
 
-    /*
-        async fn send_message(&mut self, messages: Messages) -> ChainResponse {
-            loop {
-                match self.outbound {
-                    None => {
-                        trace!("creating outbound connection {:?}", self.address);
-                        let mut conn_pool = ConnectionPool::new(
-                            self.address.clone(),
-                            CassandraCodec::new(),
-                        );
-                        // we should either connect and set the value of outbound, or return an error... so we shouldn't loop more than 2 times
-                        conn_pool.connect(1).await?;
-                        self.outbound = Some(conn_pool);
-                    }
-                    Some(ref mut outbound_framed_codec) => {
-                        trace!("sending frame upstream");
-                        let sender = outbound_framed_codec
-                            .connections
-                            .get_mut(0)
-                            .expect("No connections found");
-                        let expected_size = messages.len();
-                        let results: Result<FuturesOrdered<Receiver<(Message, ChainResponse)>>> =
-                            messages
-                                .into_iter()
-                                .map(|m| {
-                                    let (return_chan_tx, return_chan_rx) =
-                                        tokio::sync::oneshot::channel();
-                                    let stream = if let RawFrame::Cassandra(frame) = &m.original {
-                                        frame.stream_id
-                                    } else {
-                                        info!("no cassandra frame found");
-                                        return Err(anyhow!("no cassandra frame found"));
-                                    };
+#[async_trait]
+impl Transform for CassandraBloomFilter {
+    async fn transform<'a>(&'a mut self, mut message_wrapper: Wrapper<'a>) -> ChainResponse {
 
-                                    sender.send(Request {
-                                        message: m,
-                                        return_chan: Some(return_chan_tx),
-                                    })?;
+        for m in &mut message_wrapper.messages {
+            if let Some(Frame::Cassandra(CassandraFrame {
+                                             operation: CassandraOperation::Query { query, .. },
+                                             ..
+                                         })) = m.frame()
+            {
+                // pick out the statements we need to process and do it.
+                for cql_statement in &query.statements {
 
-                                    Ok(return_chan_rx)
-                                })
-                                .collect();
-
-                        let mut responses = Vec::with_capacity(expected_size);
-                        let mut results = results?;
-
-                        loop {
-                            match timeout(Duration::from_secs(5), results.next()).await {
-                                Ok(Some(prelim)) => {
-                                    match prelim? {
-                                        (_, Ok(mut resp)) => {
-                                            for message in &resp {
-                                                if let RawFrame::Cassandra(Frame {
-                                                    opcode: cassandra_protocol::frame::Opcode::Error,
-                                                    ..
-                                                }) = &message.original
-                                                {
-                                                    counter!("failed_requests", 1, "chain" => self.chain_name.clone(), "transform" => self.get_name());
-                                                }
-                                            }
-                                            responses.append(&mut resp);
-                                        }
-                                        (m, Err(err)) => {
-                                            responses.push(Message::new_response(
-                                                QueryResponse::empty_with_error(Some(
-                                                    message::Value::Strings(format!("{}", err)),
-                                                )),
-                                                true,
-                                                m.original,
-                                            ));
-                                        }
-                                    };
-                                }
-                                Ok(None) => break,
-                                Err(_) => {
-                                    info!(
-                                        "timed out waiting for results got - {:?} expected - {:?}",
-                                        responses.len(),
-                                        expected_size
-                                    );
-                                    info!(
-                                        "timed out waiting for results - {:?} - {:?}",
-                                        responses, results
-                                    );
-                                }
-                            }
-                        }
-
-                        return Ok(responses);
+                }
+                    debug!("cache transform processing {}", cql_statement);
+                    match cql_statement.get_query_type() {
+                        QueryType::Read => {}
+                        QueryType::Write => read_cache = false,
+                        QueryType::ReadWrite => read_cache = false,
+                        QueryType::SchemaChange => read_cache = false,
+                        QueryType::PubSubMessage => {}
                     }
                 }
             }
+
+        let mut response = message_wrapper.call_next_transform().await?;
+
+        for (idx, name_list) in column_names {
+            rewrite_port(&mut response[idx], &name_list, self.port);
         }
-    */
+
+        Ok(response)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -943,9 +743,7 @@ mod test {
     };
     use cassandra_protocol::frame::Version;
     use itertools::Itertools;
-    use reduce::Reduce;
     use std::collections::HashMap;
-    use cql3_parser::cassandra_ast::CassandraAST;
     use cql3_parser::cassandra_statement::CassandraStatement;
     use cql3_parser::common::{FQName, Operand, RelationElement, RelationOperator};
     use cql3_parser::select::{Named, Select, SelectElement};
@@ -1229,7 +1027,7 @@ mod test {
             Some(mut m) => {
                 let y = m.frame().unwrap().clone().into_cassandra().unwrap();
                 let z = match y.operation {
-                    CassandraOperation::Query { query, params } => query.to_query_string(),
+                    CassandraOperation::Query { query, .. } => query.to_query_string(),
                     _ => "ERROR".to_string(),
                 };
                 let cql = CQL::parse_from_string( &z );
