@@ -30,7 +30,6 @@ use cql3_parser::update::AssignmentOperator;
 use itertools::Itertools;
 use nonzero_ext::nonzero;
 use sodiumoxide::hex;
-use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
 use std::io::Cursor;
 use std::net::IpAddr;
@@ -39,19 +38,54 @@ use std::str::FromStr;
 use tracing::debug;
 use uuid::Uuid;
 
-/// Extract the length of a BATCH statement (count of requests) from the body bytes
-fn get_batch_len(bytes: &[u8]) -> Result<NonZeroU32> {
-    let len = bytes.len();
-    if len < 2 {
-        return Err(anyhow!("BATCH statement body is not long enough"));
+/// Functions for operations on an unparsed Cassandra frame
+pub mod raw_frame {
+    use super::{CassandraMetadata, RawCassandraFrame};
+    use anyhow::{anyhow, Result};
+    use cassandra_protocol::{compression::Compression, frame::Opcode};
+    use nonzero_ext::nonzero;
+    use std::convert::TryInto;
+    use std::num::NonZeroU32;
+
+    /// Extract the length of a BATCH statement (count of requests) from the body bytes
+    fn get_batch_len(bytes: &[u8]) -> Result<NonZeroU32> {
+        let len = bytes.len();
+        if len < 2 {
+            return Err(anyhow!("BATCH statement body is not long enough"));
+        }
+
+        let short_bytes = &bytes[1..3];
+        let short = u16::from_be_bytes(short_bytes.try_into()?);
+
+        // it is valid for a batch statement to have 0 statements,
+        // but for the purposes of shotover throttling we can count it as one query
+        Ok(NonZeroU32::new(short.into()).unwrap_or(nonzero!(1u32)))
     }
 
-    let short_bytes = &bytes[1..3];
-    let short = u16::from_be_bytes(short_bytes.try_into()?);
+    /// Parse metadata only from an unparsed Cassandra frame
+    pub(crate) fn metadata(bytes: &[u8]) -> Result<CassandraMetadata> {
+        let frame = RawCassandraFrame::from_buffer(bytes, Compression::None)
+            .map_err(|e| anyhow!("{e:?}"))?
+            .frame;
 
-    // it is valid for a batch statement to have 0 statements,
-    // but for the purposes of shotover throttling we can count it as one query
-    Ok(NonZeroU32::new(short.into()).unwrap_or(nonzero!(1u32)))
+        Ok(CassandraMetadata {
+            version: frame.version,
+            stream_id: frame.stream_id,
+            tracing_id: frame.tracing_id,
+        })
+    }
+
+    /// Count "cells" only from an unparsed Cassandra frame
+    pub(crate) fn cell_count(bytes: &[u8]) -> Result<NonZeroU32> {
+        let frame = RawCassandraFrame::from_buffer(bytes, Compression::None)
+            .map_err(|e| anyhow!("{e:?}"))?
+            .frame;
+
+        Ok(match frame.opcode {
+            Opcode::Batch => get_batch_len(&frame.body)?,
+            _ => nonzero!(1u32),
+        })
+    }
 }
 
 pub(crate) struct CassandraMetadata {
@@ -59,31 +93,6 @@ pub(crate) struct CassandraMetadata {
     pub stream_id: StreamId,
     pub tracing_id: Option<Uuid>,
     // missing `warnings` field because we are not using it currently
-}
-
-/// Parse metadata only from an unparsed Cassandra frame
-pub(crate) fn metadata(bytes: &[u8]) -> Result<CassandraMetadata> {
-    let frame = RawCassandraFrame::from_buffer(bytes, Compression::None)
-        .map_err(|e| anyhow!("{e:?}"))?
-        .frame;
-
-    Ok(CassandraMetadata {
-        version: frame.version,
-        stream_id: frame.stream_id,
-        tracing_id: frame.tracing_id,
-    })
-}
-
-/// Count "cells" only from an unparsed Cassandra frame
-pub(crate) fn cell_count(bytes: &[u8]) -> Result<NonZeroU32> {
-    let frame = RawCassandraFrame::from_buffer(bytes, Compression::None)
-        .map_err(|e| anyhow!("{e:?}"))?
-        .frame;
-
-    Ok(match frame.opcode {
-        Opcode::Batch => get_batch_len(&frame.body)?,
-        _ => nonzero!(1u32),
-    })
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -260,21 +269,21 @@ impl CassandraFrame {
                 // set to lowest type
                 let mut result = QueryType::SchemaChange;
                 for cql_statement in &cql.statements {
-                    result = match cql_statement.get_query_type() {
-                        QueryType::ReadWrite => QueryType::ReadWrite,
-                        QueryType::Write => match result {
-                            QueryType::ReadWrite | QueryType::Write => result,
-                            QueryType::Read => QueryType::ReadWrite,
-                            QueryType::SchemaChange | PubSubMessage => QueryType::Write,
-                        },
-                        QueryType::Read => {
+                    result = match (cql_statement.get_query_type(), &result) {
+                        (QueryType::ReadWrite, _) => QueryType::ReadWrite,
+                        (QueryType::Write, QueryType::ReadWrite | QueryType::Write) => result,
+                        (QueryType::Write, QueryType::Read) => QueryType::ReadWrite,
+                        (QueryType::Write, QueryType::SchemaChange | PubSubMessage) => {
+                            QueryType::Write
+                        }
+                        (QueryType::Read, _) => {
                             if result == QueryType::SchemaChange {
                                 QueryType::Read
                             } else {
                                 result
                             }
                         }
-                        QueryType::SchemaChange | PubSubMessage => result,
+                        (QueryType::SchemaChange | PubSubMessage, _) => result,
                     }
                 }
                 result
@@ -285,31 +294,27 @@ impl CassandraFrame {
 
     /// returns a list of table names from the CassandraOperation
     pub fn get_table_names(&self) -> Vec<&FQName> {
-        let mut result = vec![];
         match &self.operation {
-            CassandraOperation::Query { query: cql, .. } => {
-                for cql_statement in &cql.statements {
-                    if let Some(name) = CQLStatement::get_table_name(&cql_statement.statement) {
-                        result.push(name);
-                    }
-                }
-            }
-            CassandraOperation::Batch(batch) => {
-                for q in &batch.queries {
-                    if let BatchStatementType::Statement(cql) = &q.ty {
-                        for cql_statement in &cql.statements {
-                            if let Some(name) =
-                                CQLStatement::get_table_name(&cql_statement.statement)
-                            {
-                                result.push(name);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
+            CassandraOperation::Query { query: cql, .. } => cql
+                .statements
+                .iter()
+                .filter_map(|stmt| CQLStatement::get_table_name(&stmt.statement))
+                .collect(),
+            CassandraOperation::Batch(batch) => batch
+                .queries
+                .iter()
+                .filter_map(|batch_stmt| match &batch_stmt.ty {
+                    BatchStatementType::Statement(cql) => Some(cql),
+                    _ => None,
+                })
+                .flat_map(|cql| {
+                    cql.statements
+                        .iter()
+                        .filter_map(|stmt| CQLStatement::get_table_name(&stmt.statement))
+                })
+                .collect(),
+            _ => vec![],
         }
-        result
     }
 
     pub fn encode(self) -> RawCassandraFrame {
@@ -349,45 +354,28 @@ pub enum CassandraOperation {
 
 impl CassandraOperation {
     /// Return all queries contained within CassandaOperation::Query and CassandraOperation::Batch
-    /// An Err is returned if the operation cannot contain queries or the queries failed to parse.
     ///
     /// TODO: This will return a custom iterator type when BATCH support is added
     pub fn queries(&mut self) -> Vec<&mut CassandraStatement> {
-        let mut result = vec![];
-        /*
-        match self {
-            CassandraOperation::Query { query: cql, .. } => result.push( &mut *cql.statement),
-            // TODO: Return CassandraOperation::Batch queries once we add BATCH parsing to cassandra-protocol
-            _ => { }
-        }
-         */
         if let CassandraOperation::Query { query: cql, .. } = self {
-            for cql_statement in &mut cql.statements {
-                result.push(&mut cql_statement.statement)
-            }
+            cql.statements
+                .iter_mut()
+                .map(|stmt| &mut stmt.statement)
+                .collect()
+        } else {
+            Vec::<&mut CassandraStatement>::new()
         }
-        result
     }
 
     /// Return all queries contained within CassandaOperation::Query and CassandraOperation::Batch
-    /// An Err is returned if the operation cannot contain queries or the queries failed to parse.
     ///
     /// TODO: This will return a custom iterator type when BATCH support is added
     pub fn get_cql_statements(&mut self) -> Vec<&mut Box<CQLStatement>> {
-        let mut result = vec![];
-        /*
-        match self {
-            CassandraOperation::Query { query: cql, .. } => result.push( &mut *cql.statement),
-            // TODO: Return CassandraOperation::Batch queries once we add BATCH parsing to cassandra-protocol
-            _ => { }
-        }
-         */
         if let CassandraOperation::Query { query: cql, .. } = self {
-            for cql_statement in &mut cql.statements {
-                result.push(cql_statement)
-            }
+            cql.statements.iter_mut().collect()
+        } else {
+            vec![]
         }
-        result
     }
 
     fn to_direction(&self) -> Direction {
@@ -789,11 +777,6 @@ pub struct CQL {
 }
 
 impl CQL {
-    /// the number of statements in the CQL
-    pub fn get_statement_count(&self) -> usize {
-        self.statements.len()
-    }
-
     fn from_value_and_col_spec(value: &Value, col_spec: &ColSpec) -> Operand {
         match value {
             Value::Some(vec) => {
@@ -807,6 +790,9 @@ impl CQL {
             Value::NotSet => Operand::Null,
         }
     }
+
+    /// Get the value of the parameter named `name` if it exists.  Otherwise the name itself is returned as
+    /// a parameter Operand.
     fn set_param_value_by_name(
         name: &str,
         query_params: &QueryParams,
@@ -861,19 +847,11 @@ impl CQL {
         param_types: &[ColSpec],
     ) -> Operand {
         match operand {
-            Operand::Tuple(vec) => {
-                let mut vec2 = Vec::with_capacity(vec.len());
-                vec.iter().for_each(|o| {
-                    vec2.push(CQL::set_operand_if_param(
-                        o,
-                        param_idx,
-                        query_params,
-                        param_types,
-                    ))
-                });
-
-                Operand::Tuple(vec2)
-            }
+            Operand::Tuple(vec) => Operand::Tuple(
+                vec.iter()
+                    .map(|o| CQL::set_operand_if_param(o, param_idx, query_params, param_types))
+                    .collect(),
+            ),
             Operand::Param(param_name) => {
                 if param_name.starts_with('?') {
                     CQL::set_param_value_by_position(param_idx, query_params, param_types)
@@ -882,19 +860,11 @@ impl CQL {
                     CQL::set_param_value_by_name(name, query_params, param_types)
                 }
             }
-            Operand::Collection(vec) => {
-                let mut vec2 = Vec::with_capacity(vec.len());
-                vec.iter().for_each(|o| {
-                    vec2.push(CQL::set_operand_if_param(
-                        o,
-                        param_idx,
-                        query_params,
-                        param_types,
-                    ))
-                });
-
-                Operand::Collection(vec2)
-            }
+            Operand::Collection(vec) => Operand::Collection(
+                vec.iter()
+                    .map(|o| CQL::set_operand_if_param(o, param_idx, query_params, param_types))
+                    .collect(),
+            ),
             _ => operand.clone(),
         }
     }
@@ -927,18 +897,18 @@ impl CQL {
     pub fn parse_from_string(cql_query_str: &str) -> Self {
         debug!("parse_from_string: {}", cql_query_str);
         let ast = CassandraAST::new(cql_query_str);
-
-        let mut vec = Vec::with_capacity(ast.statements.len());
-
-        for statement in &ast.statements {
-            vec.push(Box::new(CQLStatement {
-                has_error: statement.0,
-                statement: statement.1.clone(),
-            }));
-        }
         CQL {
             has_error: ast.has_error(),
-            statements: vec,
+            statements: ast
+                .statements
+                .iter()
+                .map(|stmt| {
+                    Box::new(CQLStatement {
+                        has_error: stmt.0,
+                        statement: stmt.1.clone(),
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -1156,7 +1126,7 @@ mod test {
                 INSERT INTO test_cache_keyspace_batch_insert.test_table (id, x, name) VALUES (3, 13, 'baz');"#;
 
         let cql = CQL::parse_from_string(query);
-        assert_eq!(3, cql.get_statement_count());
+        assert_eq!(3, cql.statements.len());
         assert!(!cql.has_error);
     }
 
@@ -1167,7 +1137,7 @@ mod test {
                 INSERT INTO test_cache_keyspace_batch_insert.test_table (id, x, name) VALUES (3, 13, 'baz');"#;
 
         let cql = CQL::parse_from_string(query);
-        assert_eq!(3, cql.get_statement_count());
+        assert_eq!(3, cql.statements.len());
         assert!(cql.has_error);
         assert!(!cql.statements[0].has_error);
         assert!(cql.statements[1].has_error);
