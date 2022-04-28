@@ -456,7 +456,7 @@ dependencies = [
 [[package]]
 name = "cql3_parser"
 version = "0.1.1"
-source = "git+https://github.com/Claude-at-Instaclustr/rust_cql3_parser.git?branch=create_FQName#5cf2f344b6d299a6d41143b7bf1923348159eae2"
+source = "git+https://github.com/Claude-at-Instaclustr/rust_cql3_parser.git?branch=create_FQName#e0285e260b0db8494320f6b7a6ac92179f168fea"
 dependencies = [
  "bigdecimal",
  "bytes",
@@ -464,6 +464,7 @@ dependencies = [
  "itertools",
  "num",
  "regex",
+ "serde",
  "tree-sitter",
  "tree-sitter-cql 0.0.1 (git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql?branch=main)",
  "uuid",
@@ -2667,7 +2668,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "tree-sitter",
- "tree-sitter-cql 0.0.1 (git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql)",
+ "tree-sitter-cql 0.0.1 (git+https://github.com/shotover/tree-sitter-cql)",
  "uuid",
 ]
 
@@ -3162,7 +3163,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-cql"
 version = "0.0.1"
-source = "git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql#ead1375c83892111d31540e6d8d0dc563f187939"
+source = "git+https://github.com/shotover/tree-sitter-cql#ead1375c83892111d31540e6d8d0dc563f187939"
 dependencies = [
  "cc",
  "regex",

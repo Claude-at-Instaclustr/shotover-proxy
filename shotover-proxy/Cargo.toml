@@ -45,7 +45,7 @@ anyhow = "1.0.31"
 
 # Parsers
 tree-sitter = "0.20.5"
-tree-sitter-cql = { git = "https://github.com/Claude-at-Instaclustr/tree-sitter-cql" }
+tree-sitter-cql = { git = "https://github.com/shotover/tree-sitter-cql" }
 #sqlparser = "0.16"
 cql3_parser = { git = "https://github.com/Claude-at-Instaclustr/rust_cql3_parser.git", branch="create_FQName" }
 serde = { version = "1.0.111", features = ["derive"] }
