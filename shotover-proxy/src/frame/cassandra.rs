@@ -370,7 +370,7 @@ impl CassandraOperation {
     /// Return all queries contained within CassandaOperation::Query and CassandraOperation::Batch
     ///
     /// TODO: This will return a custom iterator type when BATCH support is added
-    pub fn get_cql_statements(&mut self) -> Vec<&mut Box<CQLStatement>> {
+    pub fn get_cql_statements(&mut self) -> Vec<&mut CQLStatement> {
         if let CassandraOperation::Query { query: cql, .. } = self {
             cql.statements.iter_mut().collect()
         } else {
@@ -772,7 +772,7 @@ impl Display for CQLStatement {
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct CQL {
-    pub statements: Vec<Box<CQLStatement>>,
+    pub statements: Vec<CQLStatement>,
     pub(crate) has_error: bool,
 }
 
@@ -799,6 +799,11 @@ impl CQL {
         param_types: &[ColSpec],
     ) -> Operand {
         if let Some(QueryValues::NamedValues(value_map)) = &query_params.values {
+            /*
+               this code block first uses the hash table to determine if there is a value for the name.
+               then, only if there is, does it do the longer iteration over the value map looking for the
+               name to extract the position which is then used to index the proper param_type.
+            */
             if let Some(value) = value_map.get(name) {
                 if let Some(idx) = value_map
                     .iter()
@@ -902,11 +907,9 @@ impl CQL {
             statements: ast
                 .statements
                 .iter()
-                .map(|stmt| {
-                    Box::new(CQLStatement {
-                        has_error: stmt.0,
-                        statement: stmt.1.clone(),
-                    })
+                .map(|stmt| CQLStatement {
+                    has_error: stmt.0,
+                    statement: stmt.1.clone(),
                 })
                 .collect(),
         }

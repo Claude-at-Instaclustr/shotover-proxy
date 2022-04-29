@@ -466,7 +466,7 @@ dependencies = [
  "regex",
  "serde",
  "tree-sitter",
- "tree-sitter-cql 0.0.1 (git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql?branch=main)",
+ "tree-sitter-cql",
  "uuid",
 ]
 
@@ -2667,8 +2667,6 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-cql 0.0.1 (git+https://github.com/shotover/tree-sitter-cql)",
  "uuid",
 ]
 
@@ -3154,16 +3152,6 @@ dependencies = [
 name = "tree-sitter-cql"
 version = "0.0.1"
 source = "git+https://github.com/Claude-at-Instaclustr/tree-sitter-cql?branch=main#ead1375c83892111d31540e6d8d0dc563f187939"
-dependencies = [
- "cc",
- "regex",
- "tree-sitter",
-]
-
-[[package]]
-name = "tree-sitter-cql"
-version = "0.0.1"
-source = "git+https://github.com/shotover/tree-sitter-cql#ead1375c83892111d31540e6d8d0dc563f187939"
 dependencies = [
  "cc",
  "regex",
