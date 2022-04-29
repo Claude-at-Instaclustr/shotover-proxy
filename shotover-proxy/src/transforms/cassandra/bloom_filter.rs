@@ -1,7 +1,7 @@
 use crate::error::ChainResponse;
 use crate::frame::cassandra::{CQLStatement, CassandraMetadata};
 use crate::frame::CassandraOperation::Error;
-use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, Frame, CQL, cassandra};
+use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, Frame, CQL};
 use crate::message::{Message, MessageValue, Messages, Metadata};
 use crate::transforms::{Transform, Wrapper};
 use async_trait::async_trait;
@@ -668,7 +668,7 @@ impl Transform for CassandraBloomFilter {
                                             }
                                             Some(state)
                                         },
-                                        (Some(message), None) => {
+                                        (Some(_), None) => {
                                             unreachable!()
                                         },
                                         (None, Some(state)) => {
@@ -682,7 +682,7 @@ impl Transform for CassandraBloomFilter {
                                     }
                                 } else {
                                     // if there is more than one then it can not be a select
-                                    for (msg, state) in result {
+                                    for (msg, _state) in result {
                                         if let Some(message) = msg {
                                             error_msg = Some(message);
                                         }
@@ -886,15 +886,14 @@ impl BloomFilterState {
 mod test {
     use crate::frame::CassandraOperation::Query;
     use crate::frame::Frame::Cassandra;
-    use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, CQL, Frame};
+    use crate::frame::{CassandraFrame, CassandraOperation, CassandraResult, CQL};
     use crate::message::{IntSize, Message, MessageValue};
     use crate::transforms::cassandra::bloom_filter::{
         BloomFilterState, CassandraBloomFilter, CassandraBloomFilterTableConfig, MessageState,
         SessionState,
     };
 
-    use crate::frame::cassandra::{CQLStatement, CassandraMetadata};
-    use cassandra_cpp::Session;
+    use crate::frame::cassandra::{CQLStatement};
     use cassandra_protocol::frame::frame_result::{
         ColSpec, ColType, ColTypeOption, RowsMetadata, RowsMetadataFlags,
     };
@@ -1032,7 +1031,7 @@ mod test {
         };
 
         let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 <> 'bar' and filterColumn = 0X02000000000020000000000000000080".to_string();
-        let (msg, _frame, mut message_state, cql,..) = build_message(&select_stmt);
+        let (_msg, _frame, mut message_state, cql,..) = build_message(&select_stmt);
 
         let result = get_select_result(&mut message_state, &config, &cql.statements[0]);
 
@@ -1080,7 +1079,7 @@ mod test {
         };
 
         let select_stmt = "SELECT foo FROM myTable WHERE junk <> 'bar'".to_string();
-        let (msg, _frame, mut message_state, cql,..) = build_message(&select_stmt);
+        let (_msg, _frame, mut message_state, cql,..) = build_message(&select_stmt);
 
         let result = get_select_result(&mut message_state, &config, &cql.statements[0]);
 
@@ -1184,7 +1183,7 @@ mod test {
         let mut msg = filter.process_query(&mut session_state, &frame.metadata(), msg.meta_timestamp, &mut cql);
         assert_eq!( 1, msg.len() );
         match msg.remove(0) {
-            (Some(mut msg), Some(state)) => {
+            (Some(mut msg), Some(_state)) => {
                 let y = msg.frame().unwrap().clone().into_cassandra().unwrap();
                 let z = match y.operation {
                     CassandraOperation::Query { query, .. } => query.to_query_string(),
