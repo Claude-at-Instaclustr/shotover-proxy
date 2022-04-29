@@ -12,7 +12,6 @@ use bloomfilter::bloomfilter::{BloomFilter, BloomFilterType, Shape, Simple};
 use bytes::Bytes;
 use cassandra_protocol::frame::frame_error::{AdditionalErrorInfo, ErrorBody};
 use cassandra_protocol::frame::frame_result::{ColSpec, RowsMetadata};
-use cassandra_protocol::frame::{StreamId};
 use cql3_parser::cassandra_statement::CassandraStatement;
 use cql3_parser::common::{FQName, Operand, RelationElement, RelationOperator};
 use cql3_parser::select::{Named, Select, SelectElement};
@@ -24,6 +23,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::IpAddr;
 use std::str::FromStr;
+use cql3_parser::insert::{Insert, InsertValues};
 use uuid::Uuid;
 
 /*
@@ -62,6 +62,15 @@ pub struct CassandraBloomFilterTableConfig {
     pub columns: Vec<String>,
 }
 
+impl CassandraBloomFilterTableConfig {
+    pub fn get_shape(&self) -> Shape {
+        Shape {
+            k: self.funcs,
+            m: self.bits,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CassandraBloomFilter {
     /// the outbound connection for this filter
@@ -71,8 +80,6 @@ pub struct CassandraBloomFilter {
     /// a mapping of fully qualified table names to configurations.
     /// Fully qualified => keyspace . table
     tables: HashMap<FQName, CassandraBloomFilterTableConfig>,
-    /// a mapping of messages by stream id.
-    messages: HashMap<StreamId, BloomFilterState>,
 }
 
 impl Clone for CassandraBloomFilter {
@@ -89,10 +96,7 @@ impl CassandraBloomFilter {
         let sink_single = CassandraBloomFilter {
             chain_name: chain_name.clone(),
             tables: tables.clone(),
-            messages: Default::default(),
         };
-        //register_counter!("failed_requests", Unit::Count, "chain" => chain_name, "transform" => sink_single.get_name());
-
         sink_single
     }
 
@@ -123,24 +127,7 @@ impl CassandraBloomFilter {
         parts.join("")
     }
 
-    /// create a message that is modified to request request data that is neede for bloom filter
-    /// processing
-    fn make_response(
-        &self,
-        message_state: &mut MessageState,
-        new_query: String,
-    ) -> Option<Message> {
-        let cassandra_frame = message_state.create_frame(CassandraOperation::Query {
-            query: CQL::parse_from_string(&new_query),
-            params: Default::default(),
-        });
-        let frame = crate::frame::Frame::Cassandra(cassandra_frame);
-        let mut msg = Message::from_frame(frame);
-        msg.meta_timestamp = message_state.timestamp;
-        Some(msg)
-    }
-
-    /// process the query message.  This method has to handle all possible Queries that could
+    /// process the CQL structure from the message.  This method has to handle all possible Queries that could
     /// impact the Bloom filter.
     /// The result is a vector that matches the cql.statements vector.
     /// Resulting truth table
@@ -151,7 +138,7 @@ impl CassandraBloomFilter {
     /// | No State |  #not used#                          | * Not a bloom filter affected query             |
     ///
     ///
-    fn process_query(
+    fn process_cql(
         &self,
         session_state: &mut SessionState,
         cassandra_metadata : &CassandraMetadata,
@@ -159,73 +146,160 @@ impl CassandraBloomFilter {
         cql: &mut CQL,
     ) -> Vec<(Option<Message>,Option<MessageState>)> {
         cql.statements
-            .iter()
+            .iter_mut()
             .map(|stmnt| {
                 let CQLStatement { statement, .. } = stmnt;
-                match statement {
-                    CassandraStatement::Select(select) => {
-                        let mut message_state = MessageState::new(
-                            select.clone(),
-                            cassandra_metadata.clone(),
-                            timestamp,
-                        );
-                        let table_name = session_state.fixup_table_name(&select.table_name);
-                        let cfg = self.tables.get(&table_name);
-                        match cfg {
-                            None => {
-                                message_state.ignore = true;
-                                (None, Some(message_state))
-                            }
-                            Some(config) => {
+                if let Some(raw_table_name) = CQLStatement::get_table_name(&statement) {
+                    let table_name = session_state.fixup_table_name(raw_table_name);
+                    if let Some(config) = self.tables.get(&table_name) {
+                        match &statement {
+                            CassandraStatement::Select(select) => {
+                                let mut message_state = MessageState::new(
+                                    select.clone(),
+                                    cassandra_metadata.clone(),
+                                    timestamp,
+                                );
+                                /*                                match cfg {
+                                    None => {
+                                        message_state.ignore = true;
+                                        (None, Some(message_state))
+                                    }
+                                    Some(config) => {
+                                    */
+
                                 message_state.table_name = table_name;
-                                let result = CassandraBloomFilter::process_select(
+                                match CassandraBloomFilter::process_select(
                                     &mut message_state,
                                     config,
-                                );
-                                if result.is_err() {
-                                    (self.make_error(&mut message_state, result.err().unwrap()),
-                                    Some(message_state))
-                                } else {
-                                    match result.unwrap() {
-                                        Some(new_select) => (self.make_response(
-                                            &mut message_state,
-                                            new_select.to_string(),
-                                        ), Some(message_state) ),
-                                        None => (None,Some(message_state)),
+                                ) {
+                                    Err(message) => {
+                                        let mut msg = CassandraBloomFilter::make_message(&message_state.meta, message_state.timestamp,
+                                                                                         Error(ErrorBody {
+                                                                                             error_code: 0x2200,
+                                                                                             message,
+                                                                                             additional_info: AdditionalErrorInfo::Invalid,
+                                                                                         }
+                                                                                         ));
+                                        msg.return_to_sender = true;
+                                        (Some(msg), Some(message_state))
+                                    },
+                                    Ok(result) => {
+                                        match result {
+                                            Some(new_select) =>
+                                                (Some(CassandraBloomFilter::make_message(&message_state.meta, message_state.timestamp,
+                                                                                         CassandraOperation::Query {
+                                                                                             query: CQL::parse_from_string(&new_select.to_string()),
+                                                                                             params: Default::default(),
+                                                                                         })), Some(message_state)),
+                                            None => (None, Some(message_state)),
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }
-                    CassandraStatement::Use(keyspace) => {
-                        session_state.default_keyspace = Some(keyspace.clone());
-                        (None,None)
-                    }
 
-                    /* TODO add these additional statements
-                    InsertStatement => self.process_insert(ast, message_state),
-                    DeleteStatement => self.process_delete(ast, message_state),
-                    UseStatement => { self.process_use( ast, message_state); None},
-                    */
-                    _ => {
+                            CassandraStatement::Use(keyspace) => {
+                                session_state.default_keyspace = Some(keyspace.clone());
+                                (None, None)
+                            }
+
+                            CassandraStatement::Insert(insert) => {
+                                match CassandraBloomFilter::process_insert(
+                                    &insert,
+                                    table_name,
+                                    config,
+                                ) {
+                                    Err(msg) => {
+                                        let mut new_msg = CassandraBloomFilter::make_message(cassandra_metadata, timestamp, Error(ErrorBody {
+                                            error_code: 0x2200,
+                                            message: msg,
+                                            additional_info: AdditionalErrorInfo::Invalid,
+                                        }));
+                                        new_msg.return_to_sender = true;
+                                        (Some(new_msg), None)
+                                    }
+                                    Ok(Some(new_insert)) =>
+                                        (Some(CassandraBloomFilter::make_message(cassandra_metadata, timestamp, CassandraOperation::Query {
+                                            query: CQL::parse_from_string(&new_insert.to_string()),
+                                            params: Default::default(),
+                                        })), None),
+                                    Ok(None) => (None,None)
+                                }
+                            }
+
+
+                            /* TODO add these additional statements
+                            DeleteStatement => self.process_delete(ast, message_state),
+                            UseStatement => { self.process_use( ast, message_state); None},
+                            */
+                            _ => {
+                                (None, None)
+                            }
+                        }
+                    } else {
                         (None, None)
                     }
+                } else {
+                    (None, None)
                 }
             })
             .collect_vec()
     }
 
-    fn make_error(&self, message_state: &mut MessageState, message: String) -> Option<Message> {
-        let cassandra_frame = message_state.create_frame(Error(ErrorBody {
-            error_code: 0x2200,
-            message,
-            additional_info: AdditionalErrorInfo::Invalid,
-        }));
+    fn make_message(cassandra_metadata : &CassandraMetadata, timestamp : Option<i64>, operation : CassandraOperation ) -> Message {
+        let cassandra_frame = CassandraFrame {
+            version: cassandra_metadata.version.clone(),
+            stream_id: cassandra_metadata.stream_id.clone(),
+            tracing_id: cassandra_metadata.tracing_id.clone(),
+            warnings: vec![],
+            operation,
+        };
         let frame = crate::frame::Frame::Cassandra(cassandra_frame);
         let mut new_msg = Message::from_frame(frame);
-        new_msg.meta_timestamp = message_state.timestamp;
-        new_msg.return_to_sender = true;
-        Some(new_msg)
+        new_msg.meta_timestamp = timestamp;
+        new_msg
+    }
+
+    fn process_insert(
+        insert: &Insert,
+        table_name : FQName,
+        config : &CassandraBloomFilterTableConfig
+    ) -> Result<Option<Insert>, String> {
+        // missing columns are set to null
+
+        // if the bloom filter column is inserted assume the client knows what they are doing.
+        if insert.columns.contains( &config.bloom_column ) {
+            Ok(None)
+        } else {
+            let mut new_insert = insert.clone();
+            new_insert.table_name = table_name;
+            match &mut new_insert.values {
+                InsertValues::Json(_) => Err("Column values may not be set with JSON in inserts for Bloom filter based tables".to_string()),
+                InsertValues::Values(operands) => {
+                    if operands.len() != insert.columns.len() {
+                        Err("There must be one value for each column".to_string())
+                    } else {
+                        let hashers = insert.columns
+                            .iter()
+                            .zip(operands.iter_mut())
+                            .filter_map(|(column, operand)| {
+                                if config.columns.contains(column) {
+                                    Some(CassandraBloomFilter::make_hasher(operand.to_string()))
+                                } else {
+                                    None
+                                }
+                            }).collect_vec();
+                        let mut filter = Simple::empty_instance(&config.get_shape());
+                        for hasher in hashers {
+                            filter.merge_hasher_in_place(&hasher);
+                        }
+                        new_insert.columns.push(config.bloom_column.clone());
+                        operands.push(Operand::Const(CassandraBloomFilter::as_hex(&filter)));
+                        Ok(Some(new_insert))
+                    }
+                }
+            }
+        }
+
     }
 
     fn process_select(
@@ -310,7 +384,7 @@ impl CassandraBloomFilter {
                 {
                     message_state.error = true;
                     return Err(
-                        "only equality checks are allowed if bloom filter is not provided"
+                        "Only equality checks are allowed if bloom filter is not provided"
                             .to_string(),
                     );
                 }
@@ -350,12 +424,7 @@ impl CassandraBloomFilter {
             }
             // build the bloom filter
             if !has_filter {
-                let shape = Shape {
-                    m: config.bits,
-                    k: config.funcs,
-                };
-                //let filter = Simple::from_hasher( &shape, &hashers );
-                let mut filter = Simple::empty_instance(&shape);
+                let mut filter = Simple::empty_instance(&config.get_shape());
                 for hasher in hashers {
                     filter.merge_hasher_in_place(&hasher);
                 }
@@ -651,12 +720,13 @@ impl Transform for CassandraBloomFilter {
             .iter_mut()
             .map(|msg| {
                 let timestamp = msg.meta_timestamp.clone();
+
                 match &msg.metadata() {
                     Ok(Metadata::Cassandra( cassandra_metadata )) => {
                         match &mut msg.frame() {
                             Some(Frame::Cassandra(
                                 CassandraFrame{ operation: CassandraOperation::Query{  query,.. },.. })) => {
-                                let mut result = self.process_query(&mut session_state, cassandra_metadata, timestamp, query);
+                                let mut result = self.process_cql(&mut session_state, cassandra_metadata, timestamp, query);
                                 if result.len() == 1 {
                                     match result.remove(0) {
                                         (Some(message), Some(state)) => {
@@ -782,25 +852,21 @@ impl MessageState {
     }
 
     pub fn rebuild_frame(&self) -> CassandraFrame {
-        self.create_frame(CassandraOperation::Query {
-            query: CQL {
-                statements: vec![CQLStatement {
-                    statement: CassandraStatement::Select(self.select.clone()),
-                    has_error: false,
-                }],
-                has_error: false,
-            },
-            params: Default::default(),
-        })
-    }
-
-    pub fn create_frame(&self, operation: CassandraOperation) -> CassandraFrame {
         CassandraFrame {
             version: self.meta.version.clone(),
             stream_id: self.meta.stream_id.clone(),
             tracing_id: self.meta.tracing_id.clone(),
             warnings: vec![],
-            operation,
+            operation: CassandraOperation::Query {
+                query: CQL {
+                    statements: vec![CQLStatement {
+                        statement: CassandraStatement::Select(self.select.clone()),
+                        has_error: false,
+                    }],
+                    has_error: false,
+                },
+                params: Default::default(),
+            }
         }
     }
 }
@@ -1142,7 +1208,7 @@ mod test {
 
 
 
-        let mut result = filter.process_query( &mut session_state, &frame.metadata(), msg.meta_timestamp, &mut cql);
+        let mut result = filter.process_cql(&mut session_state, &frame.metadata(), msg.meta_timestamp, &mut cql);
 
         let (msg,status) = result.remove(0);
         if let Some(Cassandra(CassandraFrame{ operation: CassandraOperation::Query{ query, .. },.. })) = msg.unwrap().frame() {
@@ -1180,7 +1246,7 @@ mod test {
         let select_stmt = "select * from mytable where bfCol1 = 'foo' LIMIT 5";
         let (msg, frame, _message_state, mut cql) = build_message(select_stmt);
 
-        let mut msg = filter.process_query(&mut session_state, &frame.metadata(), msg.meta_timestamp, &mut cql);
+        let mut msg = filter.process_cql(&mut session_state, &frame.metadata(), msg.meta_timestamp, &mut cql);
         assert_eq!( 1, msg.len() );
         match msg.remove(0) {
             (Some(mut msg), Some(_state)) => {
