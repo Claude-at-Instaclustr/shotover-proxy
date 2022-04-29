@@ -88,6 +88,7 @@ pub mod raw_frame {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct CassandraMetadata {
     pub version: Version,
     pub stream_id: StreamId,

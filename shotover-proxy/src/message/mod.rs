@@ -30,7 +30,7 @@ use std::net::IpAddr;
 use std::num::NonZeroU32;
 use uuid::Uuid;
 
-enum Metadata {
+pub(crate) enum Metadata {
     Cassandra(CassandraMetadata),
     Redis,
     None,
@@ -277,7 +277,7 @@ impl Message {
     }
 
     /// Get metadata for this `Message`
-    fn metadata(&self) -> Result<Metadata> {
+    pub(crate) fn metadata(&self) -> Result<Metadata> {
         match self.inner.as_ref().unwrap() {
             MessageInner::RawBytes {
                 bytes,
