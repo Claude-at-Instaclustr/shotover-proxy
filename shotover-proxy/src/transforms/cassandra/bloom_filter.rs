@@ -259,6 +259,8 @@ impl CassandraBloomFilter {
         new_msg
     }
 
+    /// processes the insert statement.  The resulting insert statement will be into the specified table_name and not
+    /// what is in the insert statement.
     fn process_insert(
         insert: &Insert,
         table_name : FQName,
@@ -447,7 +449,7 @@ impl CassandraBloomFilter {
     }
 
     fn as_hex(producer: &BloomFilterType) -> String {
-        let mut hex = String::from("0X");
+        let mut hex = String::from("0x");
         producer
             .get_bitmaps()
             .iter()
@@ -969,6 +971,7 @@ mod test {
     use cql3_parser::select::{Named, Select, SelectElement};
     use itertools::Itertools;
     use std::collections::HashMap;
+    use cql3_parser::insert::Insert;
 
     fn build_message(select_stmt: &str) -> (Message, CassandraFrame, MessageState, CQL) {
         let cql = CQL::parse_from_string(select_stmt);
@@ -984,17 +987,28 @@ mod test {
         };
         let metadata = frame.metadata();
         let msg = Message::from_frame(Cassandra(frame.clone()));
-        if let CQLStatement{ statement:CassandraStatement::Select(select),..} = &cql.statements[0] {
-            let message_state = MessageState::new(select.clone(), metadata, msg.meta_timestamp);
-            (
-                msg,
-                frame,
-                message_state,
-                cql
-            )
-        } else {
-            unreachable!()
-        }
+        let message_state = match &cql.statements[0].statement {
+            CassandraStatement::Select(select) =>
+                MessageState::new(select.clone(), metadata, msg.meta_timestamp),
+            CassandraStatement::Insert(_) =>
+                MessageState::new(Select {
+                    distinct: false,
+                    json: false,
+                    table_name: FQName::simple(""),
+                    columns: vec![],
+                    where_clause: vec![],
+                    order: None,
+                    limit: None,
+                    filtering: false
+                }, metadata, msg.meta_timestamp),
+            _ => panic!( "{:?}", &cql.statements[0].statement)
+        };
+        (
+            msg,
+            frame,
+            message_state,
+            cql
+        )
     }
 
     fn get_select_result(
@@ -1006,6 +1020,27 @@ mod test {
             CassandraStatement::Select(select_data) => {
                 message_state.select = select_data.clone();
                 CassandraBloomFilter::process_select(message_state, &config)
+            }
+            _ => panic!("Not a select statement"),
+        };
+        if result.is_err() {
+            assert!(false, "{}", result.err().unwrap().to_string());
+            None
+        } else {
+            result.unwrap()
+        }
+    }
+
+    /// process the insert and return the single result.
+    fn get_insert_result(
+        session_state: &SessionState,
+        config: &CassandraBloomFilterTableConfig,
+        statement: &CQLStatement,
+    ) -> Option<Insert> {
+        let result = match &statement.statement {
+            CassandraStatement::Insert(insert) => {
+                let table_name = session_state.fixup_table_name(&insert.table_name);
+                CassandraBloomFilter::process_insert(insert, table_name, config)
             }
             _ => panic!("Not a select statement"),
         };
@@ -1071,7 +1106,7 @@ mod test {
                         .as_str()
                 );
                 let stmt = statement_data.to_string();
-                assert_eq!( "SELECT foo, bfCol1 FROM myTable WHERE filterColumn = 0X02000000000020000000000000000080", stmt.as_str());
+                assert_eq!( "SELECT foo, bfCol1 FROM myTable WHERE filterColumn = 0x02000000000020000000000000000080", stmt.as_str());
             }
         }
 
@@ -1096,7 +1131,7 @@ mod test {
             columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
         };
 
-        let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 <> 'bar' and filterColumn = 0X02000000000020000000000000000080".to_string();
+        let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 <> 'bar' and filterColumn = 0x02000000000020000000000000000080".to_string();
         let (_msg, _frame, mut message_state, cql,..) = build_message(&select_stmt);
 
         let result = get_select_result(&mut message_state, &config, &cql.statements[0]);
@@ -1129,7 +1164,7 @@ mod test {
                     .contains(&expected_verify));
                 assert_eq!(0, message_state.bloomfilter.added_where.len());
                 let stmt = statement_data.to_string();
-                assert_eq!( "SELECT foo, bfCol1 FROM myTable WHERE filterColumn = 0X02000000000020000000000000000080", stmt.as_str());
+                assert_eq!( "SELECT foo, bfCol1 FROM myTable WHERE filterColumn = 0x02000000000020000000000000000080", stmt.as_str());
             }
         }
     }
@@ -1226,7 +1261,7 @@ mod test {
     pub fn test_limit_removed_when_select_processed() {
         // set the hello keyspace
         let mut session_state = SessionState::new();
-        //session_state.default_keyspace = Some( "hello".to_string() );
+
 
         let mut tables: HashMap<FQName, CassandraBloomFilterTableConfig> = HashMap::new();
         tables.insert(
@@ -1259,7 +1294,7 @@ mod test {
                 let statement = &cql.statements[0];
                 assert!(!statement.has_error);
                 assert_eq!(
-                    "SELECT * FROM mytable WHERE filterColumn = 0X0200000008000040",
+                    "SELECT * FROM mytable WHERE filterColumn = 0x0200000008000040",
                     statement.to_string()
                 );
             }
@@ -1380,6 +1415,53 @@ mod test {
                 | CassandraResult::SchemaChange(_)
                 | CassandraResult::Void => assert!(false),
             },
+        }
+    }
+
+    #[test]
+    pub fn test_process_insert() {
+        let mut session_state = SessionState::new();
+
+        let config = CassandraBloomFilterTableConfig {
+            table: FQName::simple("myTable"),
+            bloom_column: "filterColumn".to_string(),
+            bits: 72,
+            funcs: 3,
+            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
+        };
+
+        let stmts = [
+            "INSERT INTO myTable (bfCol1, bfCol2) VALUES ('foo', 'bar')",
+            "INSERT INTO myTable (bfCol1, bfCol2, Col1) VALUES ('foo', 'bar', 5)",
+            "INSERT INTO myTable (bfCol1) VALUES ('foo')",
+        ];
+        let expected = [
+            "INSERT INTO mytable (bfCol1, bfCol2, filterColumn) VALUES ('foo', 'bar', 0x02000000080020400000000000000080)",
+            "INSERT INTO mytable (bfCol1, bfCol2, Col1, filterColumn) VALUES ('foo', 'bar', 5, 0x02000000080020400000000000000080)",
+            "INSERT INTO mytable (bfCol1, filterColumn) VALUES ('foo', 0x0200000008000040)",
+        ];
+
+        for idx in 0..stmts.len() {
+            let (mut msg, _frame, mut message_state, cql) = build_message(stmts[idx]);
+            let result = get_insert_result(&session_state, &config, &cql.statements[0]);
+
+            match result {
+                None => assert!(false),
+                Some(insert) => {
+                    let stmt = insert.to_string();
+                    assert_eq!(expected[idx], stmt.as_str());
+                }
+            }
+
+            // verify original was not changed
+            let cassandra_frame = msg.frame().unwrap().clone().into_cassandra().unwrap();
+
+            match cassandra_frame.operation {
+                CassandraOperation::Query { query, .. } => {
+                    assert_eq!(stmts[idx], query.to_query_string());
+                }
+                _ => assert!(false),
+            }
         }
     }
 }
