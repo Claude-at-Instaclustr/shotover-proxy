@@ -970,7 +970,7 @@ mod test {
     use itertools::Itertools;
     use std::collections::HashMap;
 
-    pub fn build_message(select_stmt: &str) -> (Message, CassandraFrame, MessageState, CQL) {
+    fn build_message(select_stmt: &str) -> (Message, CassandraFrame, MessageState, CQL) {
         let cql = CQL::parse_from_string(select_stmt);
         let frame = CassandraFrame {
             version: Version::V3,
@@ -1268,7 +1268,7 @@ mod test {
     }
 
     #[test]
-    fn test_process_rows() {
+    pub fn test_process_rows() {
         let mut values: Vec<Vec<MessageValue>> = vec![];
         let mut row = vec![];
         row.push(MessageValue::Integer(5, IntSize::I32));
