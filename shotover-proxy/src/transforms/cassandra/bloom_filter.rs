@@ -997,7 +997,6 @@ impl MessageState {
                         statement: CassandraStatement::Select(self.select.clone()),
                         has_error: false,
                     }],
-                    has_error: false,
                 },
                 params: Default::default(),
             },
