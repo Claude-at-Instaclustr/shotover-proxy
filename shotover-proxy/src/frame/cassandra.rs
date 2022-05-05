@@ -672,7 +672,7 @@ impl CQL {
         self.statements.iter().any(|s| s.has_error)
     }
 
-    fn to_query_string(&self) -> String {
+    pub fn to_query_string(&self) -> String {
         self.statements
             .iter()
             .map(|c| c.statement.to_string())

@@ -1188,8 +1188,8 @@ mod test {
             },
         ];
         let expected = [
-            FQName::new("mykeyspace", "mytable"),
             FQName::simple("mytable"),
+            FQName::new("mykeyspace", "mytable"),
         ];
         let result = CassandraBloomFilter::new(&configs, "test");
         let mut keys = result.tables.keys();
@@ -1207,8 +1207,8 @@ mod test {
             columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
         };
 
-        let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 = 'bar'".to_string();
-        let (mut msg, _frame, mut message_state, cql) = build_message(&select_stmt);
+        let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 = 'bar'";
+        let (mut msg, _frame, mut message_state, cql) = build_message(select_stmt);
 
         let result = get_select_result(&mut message_state, &config, &cql.statements[0]);
 
@@ -1444,7 +1444,7 @@ mod test {
                 assert!(!statement.has_error);
                 assert_eq!(
                     "SELECT * FROM mytable WHERE filterColumn = 0x0200000008000040",
-                    statement.to_string()
+                    statement.to_string().as_str()
                 );
             }
             _ => panic!("Message and message state not found"),
