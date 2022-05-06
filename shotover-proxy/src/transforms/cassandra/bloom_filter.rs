@@ -71,6 +71,12 @@ impl CassandraBloomFilterTableConfig {
             m: self.bits,
         }
     }
+
+    pub fn normalize(&mut self) {
+        self.table = MessageState::normalize_fqname( &self.table );
+        self.bloom_column = self.bloom_column.to_lowercase();
+        self.columns.iter_mut().for_each( |c| *c=c.to_lowercase());
+    }
 }
 
 #[derive(Debug)]
@@ -101,22 +107,11 @@ impl CassandraBloomFilter {
         let tables: HashMap<FQName, CassandraBloomFilterTableConfig> = configs
             .iter()
             .map(|cfg| {
-                let mut hash_name = cfg.table.clone();
-                hash_name.name = hash_name.name.to_lowercase();
-                hash_name.keyspace = if let Some(keyspace_str) = hash_name.keyspace {
-                    Some(keyspace_str.to_lowercase())
-                } else {
-                    None
-                };
+                let mut value = cfg.clone();
+                value.normalize();
                 return (
-                    hash_name.clone(),
-                    CassandraBloomFilterTableConfig {
-                        table: hash_name,
-                        columns: cfg.columns.iter().map(|c| c.to_lowercase()).collect(),
-                        bits: cfg.bits,
-                        funcs: cfg.funcs,
-                        bloom_column: cfg.bloom_column.to_lowercase(),
-                    },
+                    value.table.clone(),
+                    value
                 );
             })
             .collect();
@@ -358,7 +353,7 @@ impl CassandraBloomFilter {
             .iter()
             .filter_map(|re| {
                 if let Operand::Column(name) = &re.obj {
-                    Some(name.to_lowercase())
+                    Some(name)
                 } else {
                     None
                 }
@@ -368,8 +363,7 @@ impl CassandraBloomFilter {
         // see if some of the columns are in the bloom filter configuration.
         let some_columns: bool = column_names
             .iter()
-            .filter(|c| config.columns.contains(c))
-            .next()
+            .find(|c| config.columns.contains(c))
             .is_some();
 
         if some_columns {
@@ -380,18 +374,17 @@ impl CassandraBloomFilter {
             // we will assume that the user knows what they want and not touch the filter but will
             // remove the columns from the query so the query will execute.  We will add the columns
             // to the selected columns
-            let has_filter = column_names.contains(&config.bloom_column);
+            let has_filter = column_names.contains(&&config.bloom_column);
 
             if !message_state.select.where_clause.is_empty()
                 && message_state
                     .select
                     .where_clause
                     .iter()
-                    .filter(|re| match &re.obj {
+                    .find( |re| match &re.obj {
                         Operand::List(_) => true,
                         _ => false,
                     })
-                    .next()
                     .is_some()
             {
                 message_state.error = true;
@@ -407,7 +400,7 @@ impl CassandraBloomFilter {
                 .iter()
                 .filter(|re| match &re.obj {
                     Operand::Column(name) => {
-                        !(has_filter && name.to_lowercase().eq(&config.bloom_column))
+                        !(has_filter && name.eq(&config.bloom_column))
                     }
                     _ => false,
                 })
@@ -415,10 +408,15 @@ impl CassandraBloomFilter {
 
             message_state.ignore = false;
             let selected_columns = message_state
-                .select
-                .select_names()
+                .select.columns
                 .iter()
-                .map(|c| c.to_lowercase())
+                .filter_map( |e|
+                        if let SelectElement::Column(named) = e {
+                            Some(&named.name )
+                        } else {
+                            None
+                        }
+                    )
                 .collect_vec();
             for relation in interesting_relations {
                 if !has_filter
@@ -465,7 +463,7 @@ impl CassandraBloomFilter {
                 message_state
                     .bloomfilter
                     .added_selects
-                    .retain(|s| !selected_columns.contains(&s.to_string()));
+                    .retain(|s| !selected_columns.contains(&&s.to_string()));
             }
             // build the bloom filter
             if !has_filter {
@@ -893,27 +891,11 @@ impl MessageState {
         meta: CassandraMetadata,
         timestamp: Option<i64>,
     ) -> MessageState {
+        let msg_select = MessageState::normalize_select( select );
         MessageState {
-            table_name: select.table_name.clone(),
+            table_name: msg_select.table_name.clone(),
             ignore: false,
-            select: Select {
-                distinct: select.distinct,
-                json: select.json,
-                table_name: select.table_name.clone(),
-                columns: select
-                    .columns
-                    .iter()
-                    .map( MessageState::normalize_select_element )
-                    .collect_vec(),
-                where_clause: select.where_clause
-                    .iter()
-                    .map( MessageState::normalize_relation_element)
-                    .collect_vec(),
-                order: if let Some(ord) = &select.order {
-                    Some( OrderClause{ name: ord.name.to_lowercase(), desc: ord.desc })} else {None},
-                limit: select.limit,
-                filtering: select.filtering,
-            },
+            select: msg_select,
             meta,
             bloomfilter: BloomFilterState::new(),
             timestamp,
@@ -982,6 +964,34 @@ impl MessageState {
             obj: MessageState::normalize_operand( &relation_element.obj ),
             oper: relation_element.oper.clone(),
             value: MessageState::normalize_operand( &relation_element.value ),
+        }
+    }
+
+    fn normalize_fqname( fqname : &FQName ) -> FQName {
+        FQName {
+            keyspace : if let Some(keyspace) = &fqname.keyspace {
+                Some( keyspace.to_lowercase() )
+            } else { None },
+            name : fqname.name.to_lowercase()
+        }
+    }
+    fn normalize_order( order_option : &Option<OrderClause> ) -> Option<OrderClause> {
+        match order_option {
+            None => None,
+            Some( order ) => Some( OrderClause { name: order.name.to_lowercase(), desc: order.desc }),
+        }
+    }
+
+    fn normalize_select( select : &Select ) -> Select {
+        Select {
+            distinct: select.distinct,
+            columns : select.columns.iter().map( MessageState::normalize_select_element ).collect_vec(),
+            filtering : select.filtering,
+            limit : select.limit,
+            json : select.json,
+            table_name : MessageState::normalize_fqname( &select.table_name ),
+            where_clause : select.where_clause.iter().map( MessageState::normalize_relation_element).collect_vec(),
+            order : MessageState::normalize_order( &select.order )
         }
     }
 
@@ -1104,6 +1114,18 @@ mod test {
     use itertools::Itertools;
     use std::collections::HashMap;
 
+    pub fn build_test_config() -> CassandraBloomFilterTableConfig {
+        let mut result = CassandraBloomFilterTableConfig {
+            table: FQName::simple("myTable"),
+            bloom_column: "filterColumn".to_string(),
+            bits: 72,
+            funcs: 3,
+            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
+        };
+        result.normalize();
+        result
+    }
+
     fn build_message(select_stmt: &str) -> (Message, CassandraFrame, MessageState, CQL) {
         let cql = CQL::parse_from_string(select_stmt);
         let frame = CassandraFrame {
@@ -1135,7 +1157,7 @@ mod test {
     ) -> Option<Select> {
         let result = match &statement.statement {
             CassandraStatement::Select(select_data) => {
-                message_state.select = select_data.clone();
+                message_state.select = MessageState::normalize_select( select_data );
                 CassandraBloomFilter::process_select(message_state, &config)
             }
             _ => panic!("Not a select statement"),
@@ -1172,13 +1194,7 @@ mod test {
     #[test]
     pub fn test_configuration_table_build() {
         let configs = [
-            CassandraBloomFilterTableConfig {
-                table: FQName::simple("myTable"),
-                bloom_column: "filterColumn".to_string(),
-                bits: 72,
-                funcs: 3,
-                columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
-            },
+            build_test_config(),
             CassandraBloomFilterTableConfig {
                 table: FQName::new("myKeyspace", "myTable"),
                 bloom_column: "filterColumn".to_string(),
@@ -1191,34 +1207,27 @@ mod test {
             FQName::simple("mytable"),
             FQName::new("mykeyspace", "mytable"),
         ];
-        let result = CassandraBloomFilter::new(&configs, "test");
-        let mut keys = result.tables.keys();
-        for idx in 0..keys.len() {
-            assert_eq!(Some(&expected[idx]), keys.next());
+        let mut result = CassandraBloomFilter::new(&configs, "test");
+        assert_eq!( expected.len(), result.tables.len());
+        for key in expected {
+            assert!( result.tables.remove(&key).is_some() );
         }
     }
     #[test]
     pub fn test_process_select() {
-        let config = CassandraBloomFilterTableConfig {
-            table: FQName::simple("myTable"),
-            bloom_column: "filterColumn".to_string(),
-            bits: 72,
-            funcs: 3,
-            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
-        };
-
+        let config = build_test_config();
         let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 = 'bar'";
         let (mut msg, _frame, mut message_state, cql) = build_message(select_stmt);
 
         let result = get_select_result(&mut message_state, &config, &cql.statements[0]);
 
         let expected_select = SelectElement::Column(Named {
-            name: "bfCol1".to_string(),
+            name: "bfcol1".to_string(),
             alias: None,
         });
 
         let expected_verify = RelationElement {
-            obj: Operand::Column("bfCol1".to_string()),
+            obj: Operand::Column("bfcol1".to_string()),
             oper: RelationOperator::Equal,
             value: Operand::Const("'bar'".to_string()),
         };
@@ -1227,17 +1236,8 @@ mod test {
             None => assert!(false),
             Some(statement_data) => {
                 assert!(!message_state.ignore);
-                assert_eq!(1, message_state.bloomfilter.added_selects.len());
-                assert!(message_state
-                    .bloomfilter
-                    .added_selects
-                    .contains(&expected_select));
-                assert_eq!(1, message_state.bloomfilter.verify_funcs.len());
-                assert!(message_state
-                    .bloomfilter
-                    .verify_funcs
-                    .iter()
-                    .contains(&expected_verify));
+                assert_eq!(vec![expected_select], message_state.bloomfilter.added_selects);
+                assert_eq!(vec![expected_verify], message_state.bloomfilter.verify_funcs);
                 assert_eq!(1, message_state.bloomfilter.added_where.len());
                 assert_eq!(
                     config.bloom_column.as_str(),
@@ -1251,7 +1251,7 @@ mod test {
                         .as_str()
                 );
                 let stmt = statement_data.to_string();
-                assert_eq!( "SELECT foo, bfCol1 FROM myTable WHERE filterColumn = 0x02000000000020000000000000000080", stmt.as_str());
+                assert_eq!( "SELECT foo, bfcol1 FROM mytable WHERE filtercolumn = 0x02000000000020000000000000000080", stmt.as_str());
             }
         }
 
@@ -1268,13 +1268,7 @@ mod test {
 
     #[test]
     pub fn test_process_select_with_bloom_filter() {
-        let config = CassandraBloomFilterTableConfig {
-            table: FQName::simple("myTable"),
-            bloom_column: "filterColumn".to_string(),
-            bits: 72,
-            funcs: 3,
-            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
-        };
+        let config = build_test_config();
 
         let select_stmt = "SELECT foo FROM myTable WHERE bfCol1 <> 'bar' and filterColumn = 0x02000000000020000000000000000080".to_string();
         let (_msg, _frame, mut message_state, cql, ..) = build_message(&select_stmt);
@@ -1282,12 +1276,12 @@ mod test {
         let result = get_select_result(&mut message_state, &config, &cql.statements[0]);
 
         let expected_select = SelectElement::Column(Named {
-            name: "bfCol1".to_string(),
+            name: "bfcol1".to_string(),
             alias: None,
         });
 
         let expected_verify = RelationElement {
-            obj: Operand::Column("bfCol1".to_string()),
+            obj: Operand::Column("bfcol1".to_string()),
             oper: RelationOperator::NotEqual,
             value: Operand::Const("'bar'".to_string()),
         };
@@ -1309,7 +1303,7 @@ mod test {
                     .contains(&expected_verify));
                 assert_eq!(0, message_state.bloomfilter.added_where.len());
                 let stmt = statement_data.to_string();
-                assert_eq!( "SELECT foo, bfCol1 FROM myTable WHERE filterColumn = 0x02000000000020000000000000000080", stmt.as_str());
+                assert_eq!( "SELECT foo, bfcol1 FROM mytable WHERE filtercolumn = 0x02000000000020000000000000000080", stmt.as_str());
             }
         }
     }
@@ -1367,13 +1361,9 @@ mod test {
         let mut session_state = SessionState::new();
         session_state.default_keyspace = Some("hello".to_string());
 
-        let mut table_configs = [CassandraBloomFilterTableConfig {
-            table: FQName::simple("myTable"),
-            bloom_column: "filterColumn".to_string(),
-            bits: 72,
-            funcs: 3,
-            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
-        }];
+        let mut cfg = build_test_config();
+        cfg.table = FQName::new( "hello", "mytable");
+        let mut table_configs = [cfg];
 
         let filter = CassandraBloomFilter::new(&table_configs, "testing_chain");
 
@@ -1404,7 +1394,7 @@ mod test {
             panic!("not a select statement")
         }
 
-        assert_eq!(orig_name, status.unwrap().select.table_name);
+        //assert_eq!(orig_name, status.unwrap().select.table_name);
     }
 
     #[test]
@@ -1412,17 +1402,11 @@ mod test {
         // set the hello keyspace
         let mut session_state = SessionState::new();
 
-        let table_configs = [CassandraBloomFilterTableConfig {
-            table: FQName::simple("myTable"),
-            bloom_column: "filterColumn".to_string(),
-            bits: 72,
-            funcs: 3,
-            columns: Vec::from(["bfCol1".to_string(), "bfCol2".to_string()]),
-        }];
+        let table_configs = [build_test_config()];
 
         let filter = CassandraBloomFilter::new(&table_configs, "testing_chain");
 
-        let select_stmt = "select * from mytable where bfCol1 = 'foo' LIMIT 5";
+        let select_stmt = "select * from myTable where bfCol1 = 'foo' LIMIT 5";
         let (msg, frame, _message_state, mut cql) = build_message(select_stmt);
 
         let mut msg = filter.process_cql(
@@ -1443,7 +1427,7 @@ mod test {
                 let statement = &cql.statements[0];
                 assert!(!statement.has_error);
                 assert_eq!(
-                    "SELECT * FROM mytable WHERE filterColumn = 0x0200000008000040",
+                    "SELECT * FROM mytable WHERE filtercolumn = 0x0200000008000040",
                     statement.to_string().as_str()
                 );
             }
