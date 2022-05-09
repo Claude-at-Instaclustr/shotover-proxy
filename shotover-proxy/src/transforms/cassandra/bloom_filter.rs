@@ -1648,7 +1648,7 @@ mod test {
         }
     }
 
-    struct InsertProcessData {
+    struct CQLProcessData {
         query: &'static str,
         result: &'static str,
         no_msg: bool,
@@ -1678,8 +1678,8 @@ mod test {
         };
         let timestamp = Some(500_i64);
 
-        let test_data : Vec<InsertProcessData> = vec![
-            InsertProcessData{
+        let test_data : Vec<CQLProcessData> = vec![
+            CQLProcessData {
                 query: "SELECT * FROM myTable",
                 result: "SELECT col1 FROM myTable where bfCol1='foo'",
                 no_msg : true,
@@ -1690,7 +1690,7 @@ mod test {
                 ignore: true
             },
 
-            InsertProcessData{
+            CQLProcessData {
                 query: "SELECT col1 FROM myTable where bfCol1='foo'",
                 result: "SELECT col1, bfcol1 FROM mytable WHERE filtercolumn = 0x0200000008000040",
                 no_msg: false,
@@ -1700,7 +1700,8 @@ mod test {
                 limit : None,
                 ignore: false
             },
-            InsertProcessData{
+
+            CQLProcessData {
                 query: "SELECT bfCol1 FROM myTable where bfCol2='foo'",
                 result: "SELECT bfcol1, bfcol2 FROM mytable WHERE filtercolumn = 0x0200000008000040",
                 no_msg: false,
@@ -1711,7 +1712,7 @@ mod test {
                 ignore: false
             },
 
-            InsertProcessData{
+            CQLProcessData {
                 query: "SELECT filtercolumn, bfCol1 FROM myTable where bfCol2='foo'",
                 result: "SELECT filtercolumn, bfcol1, bfcol2 FROM mytable WHERE filtercolumn = 0x0200000008000040",
                 no_msg: false,
