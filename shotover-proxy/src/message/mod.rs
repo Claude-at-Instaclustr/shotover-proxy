@@ -188,6 +188,25 @@ impl Message {
         }
     }
 
+    /// Only use for messages read straight from the socket
+    /// that are definitely in an unparsed state
+    /// (haven't passed through any transforms where they might have been parsed or modified)
+    pub(crate) fn as_raw_bytes(&self) -> Option<&Bytes> {
+        match self.inner.as_ref().unwrap() {
+            MessageInner::RawBytes { bytes, .. } => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Returns None when fails to parse the message
+    pub fn namespace(&mut self) -> Option<Vec<String>> {
+        match self.frame()? {
+            Frame::Cassandra(cassandra) => Some(cassandra.namespace()),
+            Frame::Redis(_) => unimplemented!(),
+            Frame::None => Some(vec![]),
+        }
+    }
+
     /// Batch messages have a cell count of 1 cell per inner message.
     /// Cell count is determined as follows:
     /// * Regular message - 1 cell
@@ -256,11 +275,11 @@ impl Message {
 
     // TODO: replace with a to_error_reply, should be easier to reason about
     pub fn set_error(&mut self, error: String) {
-        *self = Message::from_frame(match self.frame().unwrap() {
-            Frame::Redis(_) => {
+        *self = Message::from_frame(match self.metadata().unwrap() {
+            Metadata::Redis => {
                 Frame::Redis(RedisFrame::Error(Str::from_inner(error.into()).unwrap()))
             }
-            Frame::Cassandra(frame) => Frame::Cassandra(CassandraFrame {
+            Metadata::Cassandra(frame) => Frame::Cassandra(CassandraFrame {
                 version: frame.version,
                 stream_id: frame.stream_id,
                 operation: CassandraOperation::Error(ErrorBody {
@@ -271,7 +290,7 @@ impl Message {
                 tracing_id: frame.tracing_id,
                 warnings: vec![],
             }),
-            Frame::None => Frame::None,
+            Metadata::None => Frame::None,
         });
         self.invalidate_cache();
     }

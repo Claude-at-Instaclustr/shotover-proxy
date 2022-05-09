@@ -19,10 +19,9 @@ pub struct CassandraPeersRewriteConfig {
 
 impl CassandraPeersRewriteConfig {
     pub async fn get_transform(&self) -> Result<Transforms> {
-        Ok(Transforms::CassandraPeersRewrite(CassandraPeersRewrite {
-            port: self.port,
-            peer_table: FQName::new("system", "peers_v2"),
-        }))
+        Ok(Transforms::CassandraPeersRewrite(
+            CassandraPeersRewrite::new(self.port),
+        ))
     }
 }
 
@@ -30,6 +29,15 @@ impl CassandraPeersRewriteConfig {
 pub struct CassandraPeersRewrite {
     port: u32,
     peer_table: FQName,
+}
+
+impl CassandraPeersRewrite {
+    pub fn new(port: u32) -> Self {
+        CassandraPeersRewrite {
+            port,
+            peer_table: FQName::new("system", "peers_v2"),
+        }
+    }
 }
 
 #[async_trait]
@@ -75,7 +83,7 @@ fn extract_native_port_column(peer_table: &FQName, message: &mut Message) -> Vec
                             match select_element {
                                 SelectElement::Column(col_name) => {
                                     if col_name.name == "native_port" {
-                                        result.push(col_name.alias_or_name());
+                                        result.push(col_name.alias_or_name().to_string());
                                     }
                                 }
                                 SelectElement::Star => result.push("native_port".to_string()),

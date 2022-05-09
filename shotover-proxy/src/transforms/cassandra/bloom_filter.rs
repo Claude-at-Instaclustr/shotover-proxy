@@ -530,7 +530,7 @@ impl CassandraBloomFilter {
         let final_columns: Vec<bool> = metadata
             .col_specs
             .iter()
-            .map(|cs| !added_columns.contains(&cs.name))
+            .map(|cs| !added_columns.contains(&cs.name.as_str()))
             .collect();
 
         let mut new_metadata = if added_columns.is_empty() {
@@ -616,7 +616,7 @@ impl CassandraBloomFilter {
                     .for_each(|t| {
                         let mut bt = t.clone();
                         for col in &added_columns {
-                            bt.remove(col.as_str());
+                            bt.remove(&col.to_string() );
                         }
                         filtered_rows.push(bt);
                     });
@@ -1038,7 +1038,7 @@ impl BloomFilterState {
     }
 
     /// the column names as returned by a query for the columns we added to the query.
-    pub fn get_added_column_names(&self) -> Vec<String> {
+    pub fn get_added_column_names(&self) -> Vec<&str> {
         self.added_selects
             .iter()
             .map(|se| match se {
