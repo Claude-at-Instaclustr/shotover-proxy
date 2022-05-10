@@ -1005,7 +1005,6 @@ impl MessageState {
                 query: CQL {
                     statements: vec![CQLStatement {
                         statement: CassandraStatement::Select(self.select.clone()),
-                        has_error: false,
                     }],
                 },
                 params: Default::default(),
@@ -1425,7 +1424,6 @@ mod test {
                 };
                 let cql = CQL::parse_from_string(&z);
                 let statement = &cql.statements[0];
-                assert!(!statement.has_error);
                 assert_eq!(
                     "SELECT * FROM mytable WHERE filtercolumn = 0x0200000008000040",
                     statement.to_string().as_str()
@@ -1649,9 +1647,15 @@ mod test {
     }
 
     struct CQLProcessData {
+        /// the original query string
         query: &'static str,
+        /// the query string after processing.
         result: &'static str,
-        no_msg: bool,
+        /// if true processing produces a message that must be processed on return path
+        has_msg: bool,
+        /// if true process does produce a message state object.
+        msg_state: bool,
+        /* the contents of the message state object */
         added_selects: Vec<&'static str>,
         added_verify: Vec<&'static str>,
         added_where: Vec<&'static str>,
@@ -1679,10 +1683,12 @@ mod test {
         let timestamp = Some(500_i64);
 
         let test_data : Vec<CQLProcessData> = vec![
+
             CQLProcessData {
                 query: "SELECT * FROM myTable",
-                result: "SELECT col1 FROM myTable where bfCol1='foo'",
-                no_msg : true,
+                result: "SELECT * FROM myTable",
+                has_msg: false,
+                msg_state: true,
                 added_selects: vec!(),
                 added_verify: vec!(),
                 added_where: vec!(),
@@ -1693,7 +1699,8 @@ mod test {
             CQLProcessData {
                 query: "SELECT col1 FROM myTable where bfCol1='foo'",
                 result: "SELECT col1, bfcol1 FROM mytable WHERE filtercolumn = 0x0200000008000040",
-                no_msg: false,
+                has_msg: true,
+                msg_state: true,
                 added_selects: vec!["bfcol1"],
                 added_verify: vec!["bfcol1 = 'foo'"],
                 added_where: vec!["filtercolumn = 0x0200000008000040"],
@@ -1704,7 +1711,33 @@ mod test {
             CQLProcessData {
                 query: "SELECT bfCol1 FROM myTable where bfCol2='foo'",
                 result: "SELECT bfcol1, bfcol2 FROM mytable WHERE filtercolumn = 0x0200000008000040",
-                no_msg: false,
+                has_msg: true,
+                msg_state: true,
+                added_selects: vec!["bfcol2"],
+                added_verify: vec!["bfcol2 = 'foo'"],
+                added_where: vec!["filtercolumn = 0x0200000008000040"],
+                limit : None,
+                ignore: false
+            },
+
+            // specified filtercolum different from calculated value
+            CQLProcessData {
+                query: "SELECT bfcol1, bfcol2 FROM mytable WHERE bfCol2='foo' AND filtercolumn = 0x5200000008000040",
+                result: "SELECT bfcol1, bfcol2 FROM mytable WHERE filtercolumn = 0x5200000008000040",
+                has_msg: true,
+                msg_state: true,
+                added_selects: vec!(),
+                added_verify: vec!["bfcol2 = 'foo'"],
+                added_where: vec!(),
+                limit : None,
+                ignore: false
+            },
+
+            CQLProcessData {
+                query: "SELECT filtercolumn, bfCol1 FROM myTable where bfCol2='foo'",
+                result: "SELECT filtercolumn, bfcol1, bfcol2 FROM mytable WHERE filtercolumn = 0x0200000008000040",
+                has_msg: true,
+                msg_state: true,
                 added_selects: vec!["bfcol2"],
                 added_verify: vec!["bfcol2 = 'foo'"],
                 added_where: vec!["filtercolumn = 0x0200000008000040"],
@@ -1713,15 +1746,39 @@ mod test {
             },
 
             CQLProcessData {
-                query: "SELECT filtercolumn, bfCol1 FROM myTable where bfCol2='foo'",
-                result: "SELECT filtercolumn, bfcol1, bfcol2 FROM mytable WHERE filtercolumn = 0x0200000008000040",
-                no_msg: false,
-                added_selects: vec!["bfcol2"],
-                added_verify: vec!["bfcol2 = 'foo'"],
-                added_where: vec!["filtercolumn = 0x0200000008000040"],
+                query: "INSERT INTO myTable (bfcol1, bfcol2) VALUES ('foo', 'foo')",
+                result: "INSERT INTO mytable (bfcol1, bfcol2, filtercolumn) VALUES ('foo', 'foo', 0x0200000008000040)",
+                has_msg: true,
+                msg_state: false,
+                added_selects: vec!(),
+                added_verify: vec!(),
+                added_where: vec!(),
                 limit : None,
                 ignore: false
-            }
+            },
+
+            CQLProcessData {
+                query: "INSERT INTO myTable (bfcol1, bfcol2, filtercolumn) VALUES ('foo', 'foo', 0x0200000088000040)",
+                result: "INSERT INTO mytable (bfcol1, bfcol2, filtercolumn) VALUES ('foo', 'foo', 0x0200000088000040)",
+                has_msg: false,
+                msg_state: false,
+                added_selects: vec!(),
+                added_verify: vec!(),
+                added_where: vec!(),
+                limit : None,
+                ignore: false
+            },
+            CQLProcessData {
+                query: "USE myKeyspace",
+                result: "USE myKeyspace",
+                has_msg: false,
+                msg_state: false,
+                added_selects: vec!(),
+                added_verify: vec!(),
+                added_where: vec!(),
+                limit : None,
+                ignore: false
+            },
         ];
 
         for process_data in test_data {
@@ -1730,17 +1787,22 @@ mod test {
                 bloomfilter.process_cql(&mut session_state, &cassandra_metadata, timestamp, &mut cql);
             // first query
             assert_eq!(1, result.len(), "result length issue: {}", process_data.query);
-            if process_data.no_msg {
-                assert_eq!(None, result[0].0, "no_msg issue: {}", process_data.query);
+
+            if !process_data.has_msg {
+                assert_eq!(None, result[0].0, "has_msg issue: {}", process_data.query);
             } else {
                 if let Some(mut message) = result[0].0.clone() {
                     if let Some(Cassandra(CassandraFrame { operation: cql, .. })) = message.frame() {
                         if let CassandraOperation::Query { query: CQL { statements, .. }, .. } = cql {
                             assert_eq!(1, statements.len(), "too many statements: {}", process_data.query);
-                            if let CQLStatement { statement: CassandraStatement::Select(select), .. } = &statements[0] {
-                                assert_eq!(process_data.result, select.to_string(), "wrong result: {}", process_data.query);
-                            } else {
-                                panic!("wrong CassandraStatement: {}", process_data.query);
+                            match &statements[0] {
+                                CQLStatement { statement: CassandraStatement::Select(select), .. } => {
+                                    assert_eq!(process_data.result, select.to_string(), "wrong result: {}", process_data.query);
+                                }
+                                CQLStatement { statement: CassandraStatement::Insert(insert), .. } => {
+                                    assert_eq!(process_data.result, insert.to_string(), "wrong result: {}", process_data.query);
+                                }
+                                _ => panic!("wrong CassandraStatement: {}", process_data.query)
                             }
                         } else {
                             panic!("wrong CassandraOperation: {}", process_data.query);
@@ -1754,6 +1816,7 @@ mod test {
             }
 
             if let Some(message_state) = &result[0].1 {
+                assert!( process_data.msg_state, "{} Should not have message state", process_data.query );
                 assert_eq!(process_data.ignore, message_state.ignore, "Ignore issue: {}", process_data.query);
                 if !process_data.ignore {
                     assert_eq!(0, message_state.bloomfilter.added_values.len(), "added_values issue: {}", process_data.query);
@@ -1776,7 +1839,7 @@ mod test {
                     assert_eq!(process_data.limit, message_state.bloomfilter.limit, "limit issue: {}", process_data.query);
                 }
             } else {
-                panic!("No message state: {}", process_data.query);
+                assert!( !process_data.msg_state, "{} Should have message state", process_data.query);
             }
         }
     }

@@ -681,7 +681,7 @@ pub struct CQL {
 }
 
 impl CQL {
-    fn to_query_string(&self) -> String {
+    pub fn to_query_string(&self) -> String {
         self.statements
             .iter()
             .map(|c| c.statement.to_string())
