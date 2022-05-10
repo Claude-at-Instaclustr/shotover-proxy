@@ -508,7 +508,6 @@ impl CassandraOperation {
 #[derive(PartialEq, Debug, Clone)]
 pub struct CQLStatement {
     pub statement: CassandraStatement,
-    pub has_error: bool,
 }
 
 impl CQLStatement {
@@ -682,11 +681,7 @@ pub struct CQL {
 }
 
 impl CQL {
-    pub fn has_error(&self) -> bool {
-        self.statements.iter().any(|s| s.has_error)
-    }
-
-    pub fn to_query_string(&self) -> String {
+    fn to_query_string(&self) -> String {
         self.statements
             .iter()
             .map(|c| c.statement.to_string())
@@ -698,13 +693,21 @@ impl CQL {
     pub fn parse_from_string(cql_query_str: &str) -> Self {
         debug!("parse_from_string: {}", cql_query_str);
         let ast = CassandraAST::new(cql_query_str);
+
         CQL {
             statements: ast
                 .statements
                 .iter()
-                .map(|stmt| CQLStatement {
-                    has_error: stmt.0,
-                    statement: stmt.1.clone(),
+                .map(|(_, stmt)| match (ast.has_error(), stmt) {
+                    (true, CassandraStatement::Unknown(_)) => CQLStatement {
+                        statement: stmt.clone(),
+                    },
+                    (true, _) => CQLStatement {
+                        statement: CassandraStatement::Unknown(stmt.to_string()),
+                    },
+                    (false, _) => CQLStatement {
+                        statement: stmt.clone(),
+                    },
                 })
                 .collect(),
         }
@@ -902,6 +905,7 @@ pub struct CassandraBatch {
 #[cfg(test)]
 mod test {
     use crate::frame::CQL;
+    use cql3_parser::cassandra_statement::CassandraStatement;
 
     #[test]
     fn cql_round_trip_test() {
@@ -925,7 +929,16 @@ mod test {
 
         let cql = CQL::parse_from_string(query);
         assert_eq!(3, cql.statements.len());
-        assert!(!cql.has_error());
+        for stmt in cql.statements {
+            if let CassandraStatement::Insert(_x) = stmt.statement {
+                // do nothing
+            } else {
+                panic!(
+                    "{:?}  should have been CassandraStatement::Insert",
+                    stmt.statement
+                );
+            }
+        }
     }
 
     #[test]
@@ -936,9 +949,15 @@ mod test {
 
         let cql = CQL::parse_from_string(query);
         assert_eq!(3, cql.statements.len());
-        assert!(cql.has_error());
-        assert!(!cql.statements[0].has_error);
-        assert!(cql.statements[1].has_error);
-        assert!(!cql.statements[2].has_error);
+        for stmt in cql.statements {
+            if let CassandraStatement::Unknown(_x) = stmt.statement {
+                // do nothing
+            } else {
+                panic!(
+                    "{:?}  should have been CassandraStatement::Unknown",
+                    stmt.statement
+                );
+            }
+        }
     }
 }
